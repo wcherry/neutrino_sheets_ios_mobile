@@ -46,6 +46,9 @@ struct SettingsView: View {
         Section {
             Toggle("Grid Lines", isOn: $settings.showGridLines)
             Toggle("Formula Bar", isOn: $settings.showFormulaBar)
+            if FeatureFlags.formatting {
+                Toggle("Format Bar", isOn: $settings.showFormatBar)
+            }
 
             VStack(alignment: .leading) {
                 HStack {

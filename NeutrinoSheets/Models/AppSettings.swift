@@ -50,6 +50,7 @@ final class AppSettings: ObservableObject {
         static let defaultRowHeight   = "settings.defaultRowHeight"
         static let showGridLines      = "settings.showGridLines"
         static let showFormulaBar     = "settings.showFormulaBar"
+        static let showFormatBar      = "settings.showFormatBar"
     }
 
     // MARK: - Allowed values
@@ -116,6 +117,13 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(showFormulaBar, forKey: Keys.showFormulaBar) }
     }
 
+    /// Epic 9 — the one-tap format bar under the grid. On by default, and switchable because it
+    /// costs a row of screen on a phone that is already short of one; everything it offers is also
+    /// in the Format sheet, so turning it off loses reach, not capability.
+    @Published var showFormatBar: Bool {
+        didSet { defaults.set(showFormatBar, forKey: Keys.showFormatBar) }
+    }
+
     // MARK: - Private
 
     private let defaults: UserDefaults
@@ -136,6 +144,7 @@ final class AppSettings: ObservableObject {
             .clamped(to: Self.rowHeightRange)
         self.showGridLines = defaults.object(forKey: Keys.showGridLines) as? Bool ?? true
         self.showFormulaBar = defaults.object(forKey: Keys.showFormulaBar) as? Bool ?? true
+        self.showFormatBar = defaults.object(forKey: Keys.showFormatBar) as? Bool ?? true
     }
 
     // MARK: - Derived
@@ -162,6 +171,7 @@ final class AppSettings: ObservableObject {
         defaultRowHeight = Self.defaultRowHeight
         showGridLines = true
         showFormulaBar = true
+        showFormatBar = true
     }
 }
 

@@ -22,6 +22,15 @@ struct WorkbookEdit {
     /// The cells as the edit left them.
     let after: [Int: CellChanges]
 
+    /// Epic 9 — a tab's whole ``TableRegion`` list, before and after, for the edits that change it.
+    ///
+    /// Whole lists rather than per-region patches because the list is short — a workbook has a
+    /// handful of tables, not thousands — and because applying a table style *replaces* whatever it
+    /// overlaps, which is a change to the list as a unit. Absent for every edit that touches only
+    /// cells, which is nearly all of them.
+    let tablesBefore: [Int: [TableRegion]]
+    let tablesAfter: [Int: [TableRegion]]
+
     /// The tab that was showing before the edit, and the one to show after it — so undoing a paste
     /// made on another tab takes you back to where it happened rather than silently rewriting
     /// cells you cannot see.
@@ -33,6 +42,22 @@ struct WorkbookEdit {
 
     /// A label for the menu item, e.g. "Undo Paste".
     let name: String
+
+    init(before: [Int: CellChanges], after: [Int: CellChanges],
+         tablesBefore: [Int: [TableRegion]] = [:], tablesAfter: [Int: [TableRegion]] = [:],
+         sheetBefore: Int, sheetAfter: Int,
+         selectionBefore: SheetSelection?, selectionAfter: SheetSelection?,
+         name: String) {
+        self.before = before
+        self.after = after
+        self.tablesBefore = tablesBefore
+        self.tablesAfter = tablesAfter
+        self.sheetBefore = sheetBefore
+        self.sheetAfter = sheetAfter
+        self.selectionBefore = selectionBefore
+        self.selectionAfter = selectionAfter
+        self.name = name
+    }
 }
 
 // MARK: - EditHistory

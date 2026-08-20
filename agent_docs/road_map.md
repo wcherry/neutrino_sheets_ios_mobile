@@ -325,7 +325,7 @@ Milestone: an edit made on the phone appears on the web.
 
 Milestone 1 deliverable: log in, import keys, browse Drive, open any spreadsheet, read it correctly,
 edit a cell's literal value, save. **Delivered** — 134 unit tests at the time, all passing; the
-suite stands at 200 with Epic 8 in.
+suite stands at 269 with Epics 8 and 9 in.
 
 Two limits worth stating plainly:
 
@@ -380,16 +380,45 @@ A third limit joins the two above, and it is the one that made paste and fill po
 
 ⸻
 
-⬜ Epic 9 — Formatting
+✅ Epic 9 — Formatting
 
-* ⬜ Bold, italic, strikethrough, font size, font family
-* ⬜ Text colour, fill colour
-* ⬜ Horizontal and vertical alignment, wrap mode
-* ⬜ Borders (per side, thin/medium/thick)
-* ⬜ Number formats and the custom-format dialog
-* ⬜ Merge / unmerge
-* ⬜ Clear formatting
-* ⬜ Table style gallery and table regions
+Every command is one `CellStylePatch` applied across the selection, through the same funnel Epic 8's
+value edits use — so undo, the dirty flag and the save chain treat a fill colour exactly as they
+treat a typed number. The patch type earns its existence in one place: the web app erases a style
+field by spreading a key whose value is `undefined`, and a Swift patch of plain optionals cannot
+tell that apart from "not in this patch". Every clear would have become a silent no-op, and "Clear
+formatting" would have done nothing at all.
+
+* ✅ Bold, italic, strikethrough, font size, font family. Un-bolding writes `"normal"` rather than
+  removing the key, and the size is written in **points** (`"14pt"`) — the web app's dropdown reads
+  it back by stripping `pt`, so a size stored any other way leaves its own toolbar blank
+* ✅ Text colour, fill colour — a swatch palette plus an arbitrary-colour picker, always stored as
+  `#rrggbb`. "Automatic" is offered separately from black: a cell with no colour follows Dark Mode,
+  and one explicitly set to `#000000` does not
+* ✅ Horizontal and vertical alignment, wrap mode
+* ✅ Borders (per side, thin/medium/thick). The all-sides command clears the four per-side keys as
+  well as setting `borderStyle` — a per-side value wins when the grid draws, so a stale one left
+  behind is a border the user cannot get rid of
+* ✅ Number formats and the custom-format dialog, ported from `CustomFormatDialog.tsx` including its
+  apply rule: a typed pattern is looked up in the preset table, and a match brings its
+  `numberFormat` and `decimalPlaces` with it while a date pattern *clears* the decimal count
+* ✅ Merge / unmerge — one command, as on the web. Covered cells keep their values, so a merge
+  followed by an unmerge is lossless; Excel discards them, and the format is the contract, not Excel
+* ✅ Clear formatting. Values stay — clearing values is Epic 8's Delete, and the two are different
+  intentions. A cell left holding neither is removed rather than stored as an id and nothing else
+* ✅ Table style gallery and table regions — all 84 generated styles plus Blank, with the web app's
+  ids reproduced exactly, because a `TableStyle.id` is written into every workbook that has a table
+  in it and an id that drifted would simply stop being recognised
+
+Two things this epic changed outside itself, both deliberate:
+
+* **`tables` is now a typed field.** Epic 5 carried it opaquely; applying a table style means
+  *writing* a region, not only preserving one. Claiming a key that used to be opaque is the one
+  migration `UnknownFields` is built to survive — and a `tables` value in a shape this app cannot
+  read still falls back to the opaque path, so it is written out again rather than dropped.
+* **Undo carries table regions.** A `WorkbookEdit` now holds a tab's whole region list before and
+  after, for the edits that change it. Without that, undoing a table style would put the cells back
+  and leave the workbook still claiming a table.
 
 ⸻
 

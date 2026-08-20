@@ -34,6 +34,8 @@ struct SheetEditorView: View {
     @State private var isEditorFocused = false
     @State private var showRename = false
     @State private var formulaWarning = false
+    /// Epic 9 — the full formatting sheet, opened from the format bar or the actions menu.
+    @State private var showFormatSheet = false
 
     // MARK: - Init
 
@@ -67,6 +69,12 @@ struct SheetEditorView: View {
             .onChange(of: model.selection) { selectionMoved(to: $0) }
             .sheet(isPresented: $showRename) {
                 RenameSheet(item: item)
+            }
+            .sheet(isPresented: $showFormatSheet) {
+                FormatSheet(style: model.selectionStyle,
+                            isMerged: model.isSelectionMerged,
+                            selectionAddress: model.selection?.address ?? "",
+                            perform: perform)
             }
             .alert("Formulas aren\u{2019}t supported yet", isPresented: $formulaWarning) {
                 Button("OK", role: .cancel) { }
@@ -106,6 +114,17 @@ struct SheetEditorView: View {
                     onCommand: perform
                 )
 
+                // Epic 9 — the format bar sits under the grid rather than over it: it is used with
+                // a thumb while the eye is on the cells, and a bar at the top would put the
+                // controls at the far end of the reach from where the selection is.
+                if showsFormatBar {
+                    Divider()
+                    FormatBar(style: model.selectionStyle,
+                              isMerged: model.isSelectionMerged,
+                              perform: perform,
+                              onMore: { showFormatSheet = true })
+                }
+
                 if model.sheetNames.count > 1 {
                     Divider()
                     tabBar
@@ -114,6 +133,12 @@ struct SheetEditorView: View {
                 statusBar
             }
         }
+    }
+
+    /// Whether the format bar is shown. Hidden on a read-only share for the same reason the fill
+    /// handle is: a viewer should get a viewer, not an editor whose every control does nothing.
+    private var showsFormatBar: Bool {
+        FeatureFlags.formatting && settings.showFormatBar && model.isEditable
     }
 
     // MARK: - Formula bar
@@ -354,6 +379,18 @@ struct SheetEditorView: View {
                         }
                         .disabled(!model.isEditable)
                     }
+
+                    // Epic 9. Here as well as on the format bar, because the bar is a setting the
+                    // user can switch off and formatting must not go with it.
+                    if FeatureFlags.formatting && model.isEditable {
+                        Section {
+                            Button {
+                                showFormatSheet = true
+                            } label: {
+                                Label("Format\u{2026}", systemImage: "textformat")
+                            }
+                        }
+                    }
                 }
 
                 Section {
@@ -411,6 +448,23 @@ struct SheetEditorView: View {
         case .clear: model.clearSelection()
         case .undo:  model.undo()
         case .redo:  model.redo()
+        }
+        model.saveIfNeeded()
+    }
+
+    /// Epic 9 — the formatting counterpart of ``perform(_:)``.
+    ///
+    /// Kept separate from `GridCommand` because the two travel different routes — one comes from
+    /// the grid's own gestures and key commands, the other from SwiftUI controls — but both commit
+    /// a pending entry first, for the same reason: a style applied while a value is half-typed must
+    /// land on the cell the user is looking at, not on the one underneath the entry.
+    private func perform(_ command: FormatCommand) {
+        commitPendingEntry()
+        switch command {
+        case .style(let patch, let name): model.applyStyle(patch, name: name)
+        case .toggleMerge:                model.toggleMerge()
+        case .clearFormatting:            model.clearFormatting()
+        case .tableStyle(let style):      model.applyTableStyle(style)
         }
         model.saveIfNeeded()
     }
