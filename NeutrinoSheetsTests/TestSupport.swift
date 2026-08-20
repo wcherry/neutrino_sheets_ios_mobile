@@ -95,6 +95,34 @@ enum TestServer {
     }
 }
 
+// MARK: - MemoryPasteboard
+
+/// A pasteboard that lives only for the test.
+///
+/// `UIPasteboard.general` is shared with every other app on the machine, so a suite that used it
+/// would clear whatever the person running the tests had copied — and would read back whatever they
+/// copied next. The editor takes its pasteboard as a dependency for exactly this reason.
+final class MemoryPasteboard: PasteboardWriting {
+
+    private(set) var payload: Data?
+    private(set) var text: String?
+    /// How many times a copy has been written, so a test can assert that one happened at all.
+    private(set) var writeCount = 0
+
+    func write(payload: Data?, text: String) {
+        self.payload = payload
+        self.text = text
+        writeCount += 1
+    }
+
+    func readPayload() -> Data? { payload }
+    func readText() -> String? { text }
+    var hasContent: Bool { payload != nil || !(text ?? "").isEmpty }
+
+    /// Drops the rich payload but keeps the text, standing in for a block copied in another app.
+    func forgetRichPayload() { payload = nil }
+}
+
 // MARK: - Temp directories
 
 extension XCTestCase {

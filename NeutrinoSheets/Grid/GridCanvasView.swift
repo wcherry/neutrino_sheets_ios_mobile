@@ -7,8 +7,14 @@ import UIKit
 struct GridRenderModel {
     var sheet: SheetData?
     var geometry: GridGeometry
-    var selection: CellAddress?
+    var selection: SheetSelection?
     var showGridLines: Bool = true
+    /// The range the fill handle is currently being dragged over, drawn as a dashed preview until
+    /// the finger lifts.
+    var fillPreview: CellRange?
+    /// Whether the fill handle is drawn at all — it is an editing affordance, and a read-only
+    /// share must not offer one.
+    var showsFillHandle: Bool = false
 }
 
 // MARK: - GridCanvasView
@@ -52,6 +58,10 @@ final class GridCanvasView: UIView {
     /// Inset from the cell edge to its text, matching the web app's cell padding.
     private static let textInset: CGFloat = 4
 
+    /// Diameter of the fill handle. Small on purpose — its *touch* target is much larger, and lives
+    /// in ``GridHostView``.
+    private static let fillHandleSize: CGFloat = 11
+
     // MARK: - Init
 
     override init(frame: CGRect) {
@@ -83,6 +93,7 @@ final class GridCanvasView: UIView {
         }
         drawCells(model: model, visible: visible, clip: contentRect, in: context)
         drawSelection(model: model, in: context)
+        drawFillPreview(model: model, in: context)
 
         context.restoreGState()
     }
@@ -300,16 +311,66 @@ final class GridCanvasView: UIView {
 
     // MARK: - Selection
 
+    /// Draws the selected block: a wash over the range, the outline around it, a clear active cell,
+    /// and the fill handle at the bottom-right corner.
+    ///
+    /// The active cell is left unwashed so a range still says *where typing would go* — without it
+    /// a 30-cell selection is a rectangle with no reference point, and the formula bar's contents
+    /// belong to a cell the user cannot pick out.
     private func drawSelection(model: GridRenderModel, in context: CGContext) {
         guard let selection = model.selection else { return }
-        // A tap on a merged-away cell selects its anchor, so the highlight covers the whole merge
-        // rather than one hidden quarter of it.
-        let cell = model.sheet?.cells[selection.id]
-        let frame = model.geometry.rect(for: selection,
-                                        colSpan: cell?.colSpan ?? 1,
-                                        rowSpan: cell?.rowSpan ?? 1)
+        let range = selection.range
+        let frame = self.frame(for: range, model: model)
+
+        if !selection.isSingleCell {
+            context.setFillColor(Self.selectionColor.withAlphaComponent(0.12).cgColor)
+            context.fill(frame)
+            let active = self.frame(for: CellRange(selection.active, selection.active), model: model)
+            context.setFillColor(backgroundColor?.cgColor ?? UIColor.systemBackground.cgColor)
+            context.fill(active)
+            redrawCells(covering: active, model: model, clip: active, in: context)
+        }
+
         context.setStrokeColor(Self.selectionColor.cgColor)
         context.setLineWidth(2)
         context.stroke(frame.insetBy(dx: 1, dy: 1))
+
+        guard model.showsFillHandle else { return }
+        let handle = CGRect(x: frame.maxX - Self.fillHandleSize / 2,
+                            y: frame.maxY - Self.fillHandleSize / 2,
+                            width: Self.fillHandleSize, height: Self.fillHandleSize)
+        context.setFillColor(Self.selectionColor.cgColor)
+        context.fillEllipse(in: handle)
+        context.setStrokeColor((backgroundColor ?? .systemBackground).cgColor)
+        context.setLineWidth(1.5)
+        context.strokeEllipse(in: handle)
+    }
+
+    /// The dashed outline of a fill in progress. Drawn over everything, because the point of it is
+    /// to say how far the fill will reach before the finger lifts.
+    private func drawFillPreview(model: GridRenderModel, in context: CGContext) {
+        guard let preview = model.fillPreview else { return }
+        let frame = self.frame(for: preview, model: model)
+        context.saveGState()
+        context.setStrokeColor(Self.selectionColor.cgColor)
+        context.setLineWidth(1.5)
+        context.setLineDash(phase: 0, lengths: [5, 3])
+        context.stroke(frame.insetBy(dx: 1, dy: 1))
+        context.restoreGState()
+    }
+
+    /// The rectangle a range occupies, widened to cover any merge that reaches out of it — a
+    /// selection that stopped halfway across a merged block would highlight cells that draw
+    /// nothing.
+    private func frame(for range: CellRange, model: GridRenderModel) -> CGRect {
+        model.geometry.rect(for: range, cells: model.sheet?.cells)
+    }
+
+    /// Repaints the cells under a rectangle that was just filled over — the active cell's cutout in
+    /// a range selection. Cheaper and simpler than drawing the wash as a nine-patch around it.
+    private func redrawCells(covering rect: CGRect, model: GridRenderModel, clip: CGRect,
+                             in context: CGContext) {
+        let visible = model.geometry.visibleRange(in: rect)
+        drawCells(model: model, visible: visible, clip: clip, in: context)
     }
 }

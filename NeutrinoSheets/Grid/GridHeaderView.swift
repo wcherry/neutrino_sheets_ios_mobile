@@ -33,10 +33,17 @@ final class GridHeaderView: UIView {
         }
     }
 
-    /// The selected cell, so its row and column headers can be emphasised — the cheapest way to
-    /// keep the current address findable when the selection has scrolled out of view.
-    var selection: CellAddress? {
+    /// The selection, so the rows and columns it spans can be emphasised — the cheapest way to keep
+    /// the current address findable when the selection has scrolled out of view, and the only thing
+    /// that says how wide a range reaches once its far edge is off screen.
+    var selection: SheetSelection? {
         didSet { setNeedsDisplay() }
+    }
+
+    /// Whether this header's index falls inside the selection along its own axis.
+    private func isSelected(_ index: Int) -> Bool {
+        guard let range = selection?.range else { return false }
+        return axis == .columns ? range.columns.contains(index) : range.rows.contains(index)
     }
 
     var labelFontSize: CGFloat = 11 {
@@ -78,7 +85,7 @@ final class GridHeaderView: UIView {
                 let x = geometry.x(ofColumn: column) - contentOffset
                 let width = geometry.width(ofColumn: column)
                 let cell = CGRect(x: x, y: 0, width: width, height: bounds.height)
-                let isSelected = selection?.column == column
+                let isSelected = isSelected(column)
                 draw(label: CellAddress.columnLetters(column), in: cell,
                      font: isSelected ? selectedFont : font, highlighted: isSelected, context: context)
                 context.beginPath()
@@ -99,7 +106,7 @@ final class GridHeaderView: UIView {
                 let y = geometry.y(ofRow: row) - contentOffset
                 let height = geometry.height(ofRow: row)
                 let cell = CGRect(x: 0, y: y, width: bounds.width, height: height)
-                let isSelected = selection?.row == row
+                let isSelected = isSelected(row)
                 draw(label: String(row), in: cell,
                      font: isSelected ? selectedFont : font, highlighted: isSelected, context: context)
                 context.beginPath()

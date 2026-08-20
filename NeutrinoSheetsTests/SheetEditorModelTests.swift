@@ -9,6 +9,7 @@ final class SheetEditorModelTests: XCTestCase {
 
     private var service: SheetContentService!
     private var model: SheetEditorModel!
+    private var pasteboard: MemoryPasteboard!
 
     override func setUp() {
         super.setUp()
@@ -17,8 +18,10 @@ final class SheetEditorModelTests: XCTestCase {
         TestKeys.install()
         TestTokens.install()
         service = SheetContentService(session: MockURLProtocol.makeSession())
+        pasteboard = MemoryPasteboard()
         model = SheetEditorModel(item: Fixture.sheet(id: "s1", contentVersion: 4),
-                                 contentService: service, driveService: nil)
+                                 contentService: service, driveService: nil,
+                                 pasteboard: pasteboard)
     }
 
     override func tearDown() {
@@ -69,7 +72,7 @@ final class SheetEditorModelTests: XCTestCase {
         await model.load()
 
         XCTAssertEqual(model.sheetNames, ["Q3"])
-        XCTAssertEqual(model.selection, CellAddress(column: 1, row: 1))
+        XCTAssertEqual(model.selection?.active, CellAddress(column: 1, row: 1))
         XCTAssertEqual(model.selectedCell?.value, "7")
         XCTAssertTrue(model.isEditable)
         XCTAssertNil(model.loadError)
@@ -133,6 +136,224 @@ final class SheetEditorModelTests: XCTestCase {
         XCTAssertTrue(SheetEditorModel.isFormula("  =A1+1"))
         XCTAssertFalse(SheetEditorModel.isFormula("42"))
         XCTAssertFalse(SheetEditorModel.isFormula("a = b"))
+    }
+
+    // MARK: - Selection
+
+    func testARangeSelectionReportsItsAddressAndSummary() async throws {
+        try stubLoad(workbook: """
+        {"sheets":[{"cells":{"A1":{"id":"A1","value":"1"},"A2":{"id":"A2","value":"2"},
+                             "A3":{"id":"A3","value":"3"}}}]}
+        """)
+        await model.load()
+
+        model.selection = SheetSelection(anchor: CellAddress("A1")!, active: CellAddress("A3")!)
+
+        XCTAssertEqual(model.selection?.address, "A1:A3")
+        XCTAssertEqual(model.summary?.sum, 6)
+        XCTAssertEqual(model.summary?.count, 3)
+        // The active corner is what the formula bar edits, whichever way the drag ran.
+        XCTAssertEqual(model.selectedCell?.value, "3")
+    }
+
+    /// Repeating what a single cell already says is noise, so there is nothing to show.
+    func testASingleCellHasNoSummary() async throws {
+        try stubLoad(workbook: #"{"sheets":[{"cells":{"A1":{"id":"A1","value":"1"}}}]}"#)
+        await model.load()
+
+        XCTAssertNil(model.summary)
+    }
+
+    // MARK: - Clearing
+
+    func testClearingARangeEmptiesEveryCellButKeepsFormatting() async throws {
+        try stubLoad(workbook: """
+        {"sheets":[{"cells":{"A1":{"id":"A1","raw":"1","value":"1",
+                                   "cellStyle":{"fontWeight":"bold"}},
+                             "A2":{"id":"A2","raw":"2","value":"2"}}}]}
+        """)
+        await model.load()
+        model.selection = SheetSelection(anchor: CellAddress("A1")!, active: CellAddress("A2")!)
+
+        model.clearSelection()
+
+        XCTAssertNil(model.activeSheet?.cells["A2"])
+        // Clearing values and clearing formatting are two different intentions; this is the first.
+        XCTAssertEqual(model.activeSheet?.cells["A1"]?.cellStyle?.fontWeight, "bold")
+        XCTAssertNil(model.activeSheet?.cells["A1"]?.value)
+    }
+
+    // MARK: - Fill
+
+    func testFillingExtendsASeriesAndSelectsWhatItWrote() async throws {
+        try stubLoad(workbook: """
+        {"sheets":[{"cells":{"A1":{"id":"A1","raw":"1","value":"1"},
+                             "A2":{"id":"A2","raw":"2","value":"2"}}}]}
+        """)
+        await model.load()
+        model.selection = SheetSelection(anchor: CellAddress("A1")!, active: CellAddress("A2")!)
+
+        model.fill(to: CellRange(CellAddress("A1")!, CellAddress("A4")!))
+
+        XCTAssertEqual(model.activeSheet?.cells["A3"]?.value, "3")
+        XCTAssertEqual(model.activeSheet?.cells["A4"]?.value, "4")
+        XCTAssertEqual(model.selection?.address, "A1:A4")
+        XCTAssertTrue(model.hasUnsavedChanges)
+    }
+
+    // MARK: - Clipboard
+
+    func testCopyingWritesBothRepresentationsAndPastingRestoresThem() async throws {
+        try stubLoad(workbook: """
+        {"sheets":[{"cells":{"A1":{"id":"A1","raw":"1","value":"1",
+                                   "cellStyle":{"fontWeight":"bold"}}}}]}
+        """)
+        await model.load()
+
+        model.selection = SheetSelection(CellAddress("A1")!)
+        model.copySelection()
+
+        XCTAssertNotNil(pasteboard.readPayload())
+        XCTAssertEqual(pasteboard.readText(), "1")
+        // Copy leaves the source alone, whatever else happens next.
+        XCTAssertEqual(model.activeSheet?.cells["A1"]?.value, "1")
+
+        model.selection = SheetSelection(CellAddress("C3")!)
+        model.paste()
+
+        XCTAssertEqual(model.activeSheet?.cells["C3"]?.value, "1")
+        XCTAssertEqual(model.activeSheet?.cells["C3"]?.cellStyle?.fontWeight, "bold")
+    }
+
+    /// A cut that is never pasted must leave the workbook exactly as it was — on a phone, a cut can
+    /// be followed by a phone call rather than a paste.
+    func testCuttingRemovesNothingUntilThePasteLands() async throws {
+        try stubLoad(workbook: #"{"sheets":[{"cells":{"A1":{"id":"A1","raw":"1","value":"1"}}}]}"#)
+        await model.load()
+
+        model.selection = SheetSelection(CellAddress("A1")!)
+        model.copySelection(cut: true)
+
+        XCTAssertEqual(model.activeSheet?.cells["A1"]?.value, "1")
+
+        model.selection = SheetSelection(CellAddress("B2")!)
+        model.paste()
+
+        XCTAssertNil(model.activeSheet?.cells["A1"])
+        XCTAssertEqual(model.activeSheet?.cells["B2"]?.value, "1")
+    }
+
+    /// One gesture, one undo: the clear and the write are a single edit, so undoing a cut-paste
+    /// cannot leave the source empty and the destination full.
+    func testUndoingACutPasteRestoresBothEnds() async throws {
+        try stubLoad(workbook: #"{"sheets":[{"cells":{"A1":{"id":"A1","raw":"1","value":"1"}}}]}"#)
+        await model.load()
+
+        model.selection = SheetSelection(CellAddress("A1")!)
+        model.copySelection(cut: true)
+        model.selection = SheetSelection(CellAddress("B2")!)
+        model.paste()
+
+        model.undo()
+
+        XCTAssertEqual(model.activeSheet?.cells["A1"]?.value, "1")
+        XCTAssertNil(model.activeSheet?.cells["B2"])
+    }
+
+    func testTextCopiedInAnotherAppPastesAsCells() async throws {
+        try stubLoad(workbook: #"{"sheets":[{"cells":{}}]}"#)
+        await model.load()
+
+        pasteboard.write(payload: nil, text: "1\t2\n3\t4")
+        model.selection = SheetSelection(CellAddress("B2")!)
+        model.paste()
+
+        XCTAssertEqual(model.activeSheet?.cells["B2"]?.value, "1")
+        XCTAssertEqual(model.activeSheet?.cells["C2"]?.value, "2")
+        XCTAssertEqual(model.activeSheet?.cells["B3"]?.value, "3")
+        XCTAssertEqual(model.activeSheet?.cells["C3"]?.value, "4")
+    }
+
+    func testAViewerCanCopyButNotCutOrPaste() async throws {
+        try stubLoad(workbook: #"{"sheets":[{"cells":{"A1":{"id":"A1","value":"1"}}}]}"#,
+                     role: "viewer")
+        await model.load()
+        model.selection = SheetSelection(CellAddress("A1")!)
+
+        model.copySelection()
+        XCTAssertEqual(pasteboard.writeCount, 1)
+
+        // Reading a shared sheet is allowed; changing it is not, and `canPaste` is what the menu
+        // greys out rather than letting a tap fail silently.
+        model.copySelection(cut: true)
+        XCTAssertEqual(pasteboard.writeCount, 1)
+        XCTAssertFalse(model.canPaste)
+        model.paste()
+        XCTAssertFalse(model.hasUnsavedChanges)
+    }
+
+    // MARK: - Undo / redo
+
+    func testUndoAndRedoWalkTheEditsBothWays() async throws {
+        try stubLoad(workbook: #"{"sheets":[{"cells":{}}]}"#)
+        await model.load()
+
+        model.commitEdit("first", at: CellAddress("A1")!)
+        model.commitEdit("second", at: CellAddress("A2")!)
+
+        XCTAssertTrue(model.canUndo)
+        model.undo()
+        XCTAssertNil(model.activeSheet?.cells["A2"])
+        XCTAssertEqual(model.activeSheet?.cells["A1"]?.value, "first")
+
+        model.undo()
+        XCTAssertNil(model.activeSheet?.cells["A1"])
+        XCTAssertFalse(model.canUndo)
+
+        model.redo()
+        model.redo()
+        XCTAssertEqual(model.activeSheet?.cells["A2"]?.value, "second")
+        XCTAssertFalse(model.canRedo)
+    }
+
+    /// Once the future has been changed it is not reachable again — the rule every editor follows.
+    func testANewEditDiscardsTheRedoStack() async throws {
+        try stubLoad(workbook: #"{"sheets":[{"cells":{}}]}"#)
+        await model.load()
+
+        model.commitEdit("1", at: CellAddress("A1")!)
+        model.undo()
+        XCTAssertTrue(model.canRedo)
+
+        model.commitEdit("2", at: CellAddress("B1")!)
+
+        XCTAssertFalse(model.canRedo)
+    }
+
+    /// Undo is only meaningful against the cells it was recorded from. After a conflict reload
+    /// those cells are the server's, and replaying this device's discarded edits over them is
+    /// exactly the overwrite the conflict dialog exists to prevent.
+    func testReloadingAfterAConflictThrowsTheHistoryAway() async throws {
+        try stubLoad(workbook: #"{"sheets":[{"cells":{}}]}"#)
+        await model.load()
+        model.commitEdit("1", at: CellAddress("A1")!)
+        XCTAssertTrue(model.canUndo)
+
+        await model.reloadAfterConflict()
+
+        XCTAssertFalse(model.canUndo)
+        XCTAssertFalse(model.canRedo)
+    }
+
+    func testRetypingTheSameValueIsNotAnEdit() async throws {
+        try stubLoad(workbook: #"{"sheets":[{"cells":{"A1":{"id":"A1","raw":"1","value":"1"}}}]}"#)
+        await model.load()
+
+        model.commitEdit("1", at: CellAddress("A1")!)
+
+        // Nothing changed, so there is nothing to undo and nothing to upload.
+        XCTAssertFalse(model.canUndo)
+        XCTAssertFalse(model.hasUnsavedChanges)
     }
 
     // MARK: - The save chain
