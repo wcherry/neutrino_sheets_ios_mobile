@@ -106,8 +106,6 @@ struct CellAddress: Hashable, Comparable, CustomStringConvertible {
 // MARK: - CellRange
 
 /// A rectangular block of cells, as written `A1:C10`.
-///
-/// Phase 1 uses this for the address label and for merge bookkeeping; range *selection* is Epic 8.
 struct CellRange: Hashable {
 
     let start: CellAddress
@@ -128,4 +126,70 @@ struct CellRange: Hashable {
         (start.column...end.column).contains(address.column)
             && (start.row...end.row).contains(address.row)
     }
+
+    // MARK: - Extent
+
+    var columns: ClosedRange<Int> { start.column...end.column }
+    var rows: ClosedRange<Int> { start.row...end.row }
+    var columnCount: Int { end.column - start.column + 1 }
+    var rowCount: Int { end.row - start.row + 1 }
+    var cellCount: Int { columnCount * rowCount }
+
+    /// Every address in the block, row-major — the order a reader scans a grid in, and the order a
+    /// paste has to write in so a formula referring to a cell above it sees the new value.
+    var addresses: [CellAddress] {
+        var result: [CellAddress] = []
+        result.reserveCapacity(cellCount)
+        for row in rows {
+            for column in columns {
+                result.append(CellAddress(column: column, row: row))
+            }
+        }
+        return result
+    }
+
+    /// The smallest range containing both this one and `other`.
+    func union(_ other: CellRange) -> CellRange {
+        CellRange(CellAddress(column: min(start.column, other.start.column),
+                              row: min(start.row, other.start.row)),
+                  CellAddress(column: max(end.column, other.end.column),
+                              row: max(end.row, other.end.row)))
+    }
+}
+
+// MARK: - SheetSelection
+
+/// What is selected on the active tab: a rectangle, plus which of its cells is *active*.
+///
+/// The two are kept in one value rather than as two published properties because they are only ever
+/// meaningful together — an anchor without an active cell describes nothing, and a pair that drifts
+/// apart is the classic way a range selection ends up highlighting one block while editing another.
+///
+/// - `anchor` is the corner a drag started from; it does not move while the drag runs.
+/// - `active` is the corner under the finger, and is the cell the formula bar edits.
+struct SheetSelection: Hashable {
+
+    var anchor: CellAddress
+    var active: CellAddress
+
+    init(_ address: CellAddress) {
+        anchor = address
+        active = address
+    }
+
+    init(anchor: CellAddress, active: CellAddress) {
+        self.anchor = anchor
+        self.active = active
+    }
+
+    /// The normalised rectangle the two corners describe.
+    var range: CellRange { CellRange(anchor, active) }
+
+    var isSingleCell: Bool { anchor == active }
+
+    /// What the formula bar's reference box shows: `A1`, or `A1:C10` for a block.
+    var address: String { range.address }
+
+    /// Moves the whole selection to one cell, collapsing any range.
+    static func single(_ address: CellAddress) -> SheetSelection { SheetSelection(address) }
 }

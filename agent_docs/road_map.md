@@ -324,7 +324,8 @@ Milestone: an edit made on the phone appears on the web.
 ⸻
 
 Milestone 1 deliverable: log in, import keys, browse Drive, open any spreadsheet, read it correctly,
-edit a cell's literal value, save. **Delivered** — 134 unit tests, all passing.
+edit a cell's literal value, save. **Delivered** — 134 unit tests at the time, all passing; the
+suite stands at 200 with Epic 8 in.
 
 Two limits worth stating plainly:
 
@@ -342,16 +343,40 @@ Phase 2 — Editing
 
 Goal: an editing model that suits a touchscreen rather than a transplanted desktop one.
 
-⬜ Epic 8 — Cell Editing
+✅ Epic 8 — Cell Editing
 
-* ⬜ Tap to select, double-tap / Return to edit
-* ⬜ Formula bar with cell reference box
-* ⬜ Numeric keyboard accessory row (`= ( ) : , $ %` and arrows)
-* ⬜ Range selection by drag, with a live sum/count/average status bar
-* ⬜ Fill handle (drag to fill, series detection)
-* ⬜ Cut / copy / paste including styles and relative-reference rewriting
-* ⬜ Undo / redo
-* ⬜ Autosave on an interval from Settings
+* ✅ Tap to select, double-tap / Return to edit. The grid takes first responder on a tap, so a
+  hardware keyboard drives it too — arrows move, shift-arrows extend, Tab steps right, Delete
+  clears, ⌘C/X/V and ⌘Z work
+* ✅ Formula bar with cell reference box. The box doubles as the range readout (`A1:C10`)
+* ✅ Numeric keyboard accessory row (`= ( ) : , $ %` and arrows). The field is `UITextField` rather
+  than SwiftUI's `TextField` for this: a symbol has to insert at the **caret**, and SwiftUI exposes
+  no caret position — a SwiftUI field could only append. The arrows commit and step, which is what
+  makes typing a column possible without touching the screen between cells
+* ✅ Range selection by drag, with a live sum/count/average status bar. The drag is long-press-then-
+  move rather than a pan: a pan would have to be arbitrated against the scroll view's own, and
+  losing that argument is how a grid ends up unable to scroll. Holding without moving raises the
+  edit menu instead. Dragging near an edge auto-scrolls
+* ✅ Fill handle (drag to fill, series detection) — numbers (least-squares, so an uneven run still
+  follows its trend), dates, months, weekdays, and text ending in digits (`Item 1` → `Item 2`).
+  Excel's single-cell asymmetry is matched deliberately: a lone number repeats, a lone date advances
+* ✅ Cut / copy / paste including styles and relative-reference rewriting. The block goes on the
+  pasteboard twice — rich JSON under a private type, and TSV so other apps can read it — and paste
+  prefers the rich payload. `encodeFormula` / `decodeFormula` are ported from the web app rather
+  than reinvented, so a formula copied on a phone shifts the way the browser would shift it
+* ✅ Undo / redo — per-cell patches, not snapshots. A snapshot of a 10k-cell tab per keystroke is
+  megabytes of history for a two-character edit. Capped at the web app's `MAX_HISTORY` of 100
+* ✅ Autosave on an interval from Settings
+
+A third limit joins the two above, and it is the one that made paste and fill possible at all:
+
+* **A pasted or filled formula keeps its references and loses its value.** Typing a formula is still
+  refused, but propagating one that is already in the file is not the same act — refusing a paste
+  because one cell in the block holds a formula would be worse than useless. So the references are
+  rewritten and the *stale result is dropped*. The cell then shows its own formula text here, and
+  recomputes the moment the workbook is opened on the web, which re-evaluates every formula on load
+  (`evaluateSheetMap`). Carrying the source's value across is the one thing that would put a wrong
+  number in a shared file.
 
 ⸻
 
@@ -646,7 +671,9 @@ The MVP is complete when a user can:
 * ✅ Create, rename, move, duplicate and delete spreadsheets
 * ✅ Open any spreadsheet made on the web and see it render correctly — styles, number formats,
   merges, multiple tabs
-* ⚠️ Edit cell **values**, with autosave back to Drive. Formulas are refused until Epic 15
+* ⚠️ Edit cell **values** — typing, range selection, fill, cut/copy/paste, undo/redo, autosave
+  back to Drive. Typing a formula is refused until Epic 15; a pasted or filled one keeps its
+  references and drops its stale value, and recomputes when the sheet is next opened on the web
 * ✅ Encrypt all content before upload and decrypt it locally after download
 * ✅ Save without ever destroying charts, conditional formats or table regions the phone cannot yet
   render

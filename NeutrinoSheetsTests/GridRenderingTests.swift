@@ -22,7 +22,10 @@ final class GridRenderingTests: XCTestCase {
     /// trait collection, and a test asserting "the text is dark" would otherwise flip meaning with
     /// the simulator's appearance.
     private func render(_ sheet: SheetData?, selection: CellAddress? = nil,
+                        range: SheetSelection? = nil,
                         showGridLines: Bool = true,
+                        fillPreview: CellRange? = nil,
+                        showsFillHandle: Bool = false,
                         size: CGSize = CGSize(width: 400, height: 200),
                         contentOrigin: CGPoint = .zero) -> Sampler {
         let canvas = GridCanvasView(frame: CGRect(origin: .zero, size: size))
@@ -31,8 +34,10 @@ final class GridRenderingTests: XCTestCase {
         canvas.model = GridRenderModel(
             sheet: sheet,
             geometry: GridGeometry(sheet: sheet, metrics: metrics),
-            selection: selection,
-            showGridLines: showGridLines
+            selection: range ?? selection.map(SheetSelection.init),
+            showGridLines: showGridLines,
+            fillPreview: fillPreview,
+            showsFillHandle: showsFillHandle
         )
 
         let renderer = UIGraphicsImageRenderer(size: size)
@@ -263,6 +268,80 @@ final class GridRenderingTests: XCTestCase {
             if c.b > 150 && c.r < 120 { foundTint = true }
         }
         XCTAssertTrue(foundTint, "no selection outline on B2")
+    }
+
+    // MARK: - Range selection (Epic 8)
+
+    /// A range is washed with tint except for its active cell, which stays clear so the block still
+    /// says where typing would go.
+    func testARangeIsWashedButItsActiveCellIsNot() {
+        let selection = SheetSelection(anchor: CellAddress(column: 1, row: 1),
+                                       active: CellAddress(column: 2, row: 2))
+        let sampler = render(SheetData(name: "S"), range: selection)
+
+        // A1 and B1 are inside the range and away from its outline, so they carry the wash...
+        let washed = sampler.color(at: CGPoint(x: 50, y: 14))
+        XCTAssertLessThan(washed.r, 250, "A1 is inside the selection but was not tinted")
+        XCTAssertGreaterThan(washed.b, washed.r, "the wash should read as tint, not grey")
+
+        // ...while B2, the active cell, is left as the page.
+        assertNear(sampler.color(at: CGPoint(x: 150, y: 42)), (255, 255, 255))
+
+        // And a cell outside the range is untouched.
+        assertNear(sampler.color(at: CGPoint(x: 250, y: 70)), (255, 255, 255))
+    }
+
+    /// The cutout under the active cell is repainted rather than left blank, or a range drawn over
+    /// a populated cell would erase its contents.
+    func testTheActiveCellsContentSurvivesTheRangeWash() {
+        let sheet = SheetData(name: "S", cells: [
+            "B2": SavedCell(id: "B2", value: "1234"),
+        ])
+        let selection = SheetSelection(anchor: CellAddress(column: 1, row: 1),
+                                       active: CellAddress(column: 2, row: 2))
+
+        let sampler = render(sheet, range: selection)
+
+        XCTAssertTrue(sampler.hasDarkPixels(in: CGRect(x: 104, y: 32, width: 92, height: 20)),
+                      "the active cell's text was painted over by the selection wash")
+    }
+
+    func testTheFillHandleIsOnlyDrawnWhenEditingIsAllowed() {
+        let selection = SheetSelection(CellAddress(column: 1, row: 1))
+        // The handle straddles A1's bottom-right corner at (100, 28).
+        let corner = CGRect(x: 96, y: 24, width: 8, height: 8)
+
+        let editable = render(SheetData(name: "S"), range: selection, showsFillHandle: true)
+        let viewer = render(SheetData(name: "S"), range: selection, showsFillHandle: false)
+
+        var foundHandle = false
+        for x in stride(from: corner.minX, to: corner.maxX, by: 1) {
+            for y in stride(from: corner.minY, to: corner.maxY, by: 1) {
+                let c = editable.color(at: CGPoint(x: x, y: y))
+                if c.b > 150 && c.r < 120 { foundHandle = true }
+            }
+        }
+        XCTAssertTrue(foundHandle, "no fill handle at the corner of the selection")
+
+        // A read-only share gets a viewer, not an editor with a dead handle on it.
+        XCTAssertFalse(viewer.hasDarkPixels(in: CGRect(x: 101, y: 29, width: 4, height: 4),
+                                            threshold: 250),
+                       "the fill handle was drawn on a read-only sheet")
+    }
+
+    func testTheFillPreviewIsDrawnBeyondTheSelection() {
+        let selection = SheetSelection(CellAddress(column: 1, row: 1))
+        let preview = CellRange(CellAddress(column: 1, row: 1), CellAddress(column: 1, row: 3))
+
+        let sampler = render(SheetData(name: "S"), range: selection, fillPreview: preview)
+
+        // The preview's bottom edge runs along y = 84, well past the selection's own outline.
+        var foundDash = false
+        for x in stride(from: 2.0, to: 98.0, by: 1) {
+            let c = sampler.color(at: CGPoint(x: x, y: 83))
+            if c.b > 150 && c.r < 120 { foundDash = true }
+        }
+        XCTAssertTrue(foundDash, "no fill preview outline below the selection")
     }
 
     // MARK: - Number formats end to end

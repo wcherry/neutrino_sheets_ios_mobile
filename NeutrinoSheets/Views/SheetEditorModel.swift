@@ -6,13 +6,16 @@ import os.log
 
 /// The state of one open workbook: what was loaded, what has changed, and what is being written.
 ///
-/// Kept out of the view because two of its responsibilities are genuinely stateful and easy to get
-/// wrong in a `View`'s `@State`:
+/// Kept out of the view because three of its responsibilities are genuinely stateful and easy to
+/// get wrong in a `View`'s `@State`:
 ///
 /// - **The save chain.** Never two autosave PUTs in flight at once. The web app hit real body
 ///   truncation doing that (see `usePersistence`'s `saveChainRef`), and the same shape of bug on a
 ///   phone would silently drop an edit.
 /// - **Conflict.** A 409 is a decision for the user, not something to retry into.
+/// - **Editing.** Every mutation goes through one funnel (``apply(_:name:selectionAfter:)``) so
+///   that undo, the dirty flag and the selection cannot fall out of step with the cells — which is
+///   exactly what happens when each command mutates the workbook its own way.
 @MainActor
 final class SheetEditorModel: ObservableObject {
 
@@ -21,16 +24,25 @@ final class SheetEditorModel: ObservableObject {
     @Published private(set) var file: SheetFile?
     @Published private(set) var info: SheetFileInfo?
     @Published var activeSheetIndex: Int = 0
-    @Published var selection: CellAddress?
+    /// The selected block and its active cell. See ``SheetSelection``.
+    @Published var selection: SheetSelection?
 
     @Published private(set) var isLoading = false
     @Published private(set) var isSaving = false
     @Published private(set) var hasUnsavedChanges = false
     @Published var loadError: String?
     @Published var saveError: String?
+    /// A short, self-clearing message for something worth saying but not worth interrupting for —
+    /// "3 cells pasted", or the note that pasted formulas recalculate on the web.
+    @Published private(set) var notice: String?
     /// Set when the server refused a save because the workbook moved on elsewhere. Surfaced to the
     /// user, never resolved silently — overwriting is not this app's decision to make.
     @Published var conflict: ConflictState?
+
+    /// Bumped on every recorded edit, purely so SwiftUI re-reads ``canUndo`` / ``canRedo``. The
+    /// history itself is a value type inside a non-published property; without this the toolbar
+    /// buttons would keep whatever enabled state they were first drawn with.
+    @Published private(set) var historyToken = 0
 
     struct ConflictState: Identifiable {
         let id = UUID()
@@ -43,6 +55,7 @@ final class SheetEditorModel: ObservableObject {
     private let item: SheetItem
     private var contentService: SheetContentService
     private weak var driveService: SheetsDriveService?
+    private let pasteboard: PasteboardWriting
 
     // MARK: - Session state
 
@@ -53,6 +66,16 @@ final class SheetEditorModel: ObservableObject {
     private var contentVersion: Int?
     /// True until the plaintext the server seeded at create time has been replaced by ciphertext.
     private var needsInitialEncryption = false
+
+    /// Epic 8 — "Undo / redo".
+    private var history = EditHistory()
+
+    /// Where the last cut came from, so the paste that follows can clear it.
+    ///
+    /// The source is *not* cleared at cut time. A cut with no paste has to leave the workbook
+    /// exactly as it was — on a phone, where a cut can be followed by a phone call rather than a
+    /// paste, clearing early is a way to lose data.
+    private var cutSource: (sheetIndex: Int, range: CellRange)?
 
     /// The chain every save links onto, so no two writes overlap. Awaiting the previous task before
     /// starting the next is the whole mechanism.
@@ -65,15 +88,20 @@ final class SheetEditorModel: ObservableObject {
     /// twice. Without this, a single edit produces two PUTs — the timer's and the flush's.
     private var isSaveQueued = false
 
+    /// Clears ``notice`` after a beat, cancelled and restarted by each new one.
+    private var noticeTask: Task<Void, Never>?
+
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "NeutrinoSheets",
                                 category: "SheetEditorModel")
 
     // MARK: - Init
 
-    init(item: SheetItem, contentService: SheetContentService, driveService: SheetsDriveService?) {
+    init(item: SheetItem, contentService: SheetContentService, driveService: SheetsDriveService?,
+         pasteboard: PasteboardWriting = SystemPasteboard()) {
         self.item = item
         self.contentService = contentService
         self.driveService = driveService
+        self.pasteboard = pasteboard
     }
 
     /// Re-points the model at the environment's services.
@@ -107,11 +135,30 @@ final class SheetEditorModel: ObservableObject {
         return file.sheets[activeSheetIndex]
     }
 
-    /// The cell the selection names, if it holds anything.
+    /// The cell the selection's active corner names, if it holds anything.
     var selectedCell: SavedCell? {
         guard let selection else { return nil }
-        return activeSheet?.cells[selection.id]
+        return activeSheet?.cells[selection.active.id]
     }
+
+    /// Epic 8 — the live sum / count / average under a range selection.
+    ///
+    /// Nil for a single cell: a status bar reading "Sum 42, Count 1" over one cell is repeating
+    /// what the cell already says.
+    var summary: RangeSummary? {
+        guard let selection, !selection.isSingleCell, let sheet = activeSheet else { return nil }
+        let summary = RangeSummary(range: selection.range, cells: sheet.cells)
+        return summary.isEmpty ? nil : summary
+    }
+
+    var canUndo: Bool { history.canUndo }
+    var canRedo: Bool { history.canRedo }
+    var undoName: String? { history.undoName }
+    var redoName: String? { history.redoName }
+
+    /// Whether the clipboard holds anything. Asks without reading, so checking does not put the
+    /// system's paste permission banner in front of the user.
+    var canPaste: Bool { isEditable && pasteboard.hasContent }
 
     // MARK: - Loading
 
@@ -129,7 +176,9 @@ final class SheetEditorModel: ObservableObject {
             contentVersion = loaded.info.contentVersion
             needsInitialEncryption = loaded.needsInitialEncryption
             activeSheetIndex = 0
-            selection = CellAddress(column: 1, row: 1)
+            selection = SheetSelection(CellAddress(column: 1, row: 1))
+            history.clear()
+            cutSource = nil
 
             // A brand-new spreadsheet is still holding the server's *plaintext* seed. Encrypting it
             // is the first thing to do, before the user can type anything into it — but through the
@@ -148,35 +197,244 @@ final class SheetEditorModel: ObservableObject {
 
     /// Commits a literal value typed into a cell.
     ///
-    /// Phase 1 edits **literals only**. `raw` and `value` are written to the same text, which is
+    /// Phase 1 *typing* is literals only. `raw` and `value` are written to the same text, which is
     /// correct for a literal and deliberately wrong for a formula — there is no evaluator yet
     /// (Epic 15), so a formula typed here would be stored with a display value it does not produce.
-    /// ``isFormula(_:)`` is what the editor uses to refuse that.
+    /// ``isFormula(_:)`` is what the editor uses to refuse that. Paste and fill take a different
+    /// route: see ``SheetClipboard/changes(at:into:existing:)``.
     ///
     /// Cells that end up empty are removed rather than stored blank, matching what the web app
     /// writes: an empty cell is an absent key, not a key holding "".
     func commitEdit(_ text: String, at address: CellAddress) {
-        guard isEditable, var file, file.sheets.indices.contains(activeSheetIndex) else { return }
-        var sheet = file.sheets[activeSheetIndex]
-
+        guard let sheet = activeSheet else { return }
         var cell = sheet.cells[address.id] ?? SavedCell(id: address.id)
-        let trimmed = text
-        cell.raw = trimmed.isEmpty ? nil : trimmed
-        cell.value = trimmed.isEmpty ? nil : trimmed
+        cell.raw = text.isEmpty ? nil : text
+        cell.value = text.isEmpty ? nil : text
 
-        if cell.isEmpty {
-            sheet.cells.removeValue(forKey: address.id)
-        } else {
-            sheet.cells[address.id] = cell
+        var changes = CellChanges()
+        changes.updateValue(cell.isEmpty ? nil : cell, forKey: address.id)
+        // No selection override: where the cursor goes after an entry is the view's business —
+        // Return steps down, an arrow steps sideways, and a tap elsewhere has already moved it.
+        // Forcing it back to `address` here would yank the selection off the cell the user just
+        // tapped.
+        apply(changes, name: "Typing")
+    }
+
+    /// Empties every selected cell, keeping its formatting — the Delete key, and the "Clear"
+    /// command. Formatting is left because clearing values and clearing formatting are two
+    /// different intentions, and Epic 9 is where the second one lives.
+    func clearSelection() {
+        guard let sheet = activeSheet, let selection else { return }
+        var changes = CellChanges()
+        for address in selection.range.addresses {
+            guard var cell = sheet.cells[address.id] else { continue }
+            // Nothing to clear, and recording it would put an edit that changed nothing into the
+            // history.
+            guard !(cell.raw ?? "").isEmpty || !(cell.value ?? "").isEmpty else { continue }
+            cell.raw = nil
+            cell.value = nil
+            changes.updateValue(cell.isEmpty ? nil : cell, forKey: address.id)
         }
-        file.sheets[activeSheetIndex] = sheet
-        self.file = file
-        hasUnsavedChanges = true
+        apply(changes, name: "Clear")
     }
 
     /// Whether text is a formula, which Phase 1 cannot evaluate.
     static func isFormula(_ text: String) -> Bool {
-        text.trimmingCharacters(in: .whitespaces).hasPrefix("=")
+        FormulaReferences.isFormula(text)
+    }
+
+    // MARK: - Fill
+
+    /// Epic 8 — the fill handle. Extends the selection's cells across `target`, which must contain
+    /// the selection and grow along one axis. See ``FillEngine``.
+    func fill(to target: CellRange) {
+        guard isEditable, let sheet = activeSheet, let selection else { return }
+        let source = selection.range
+        let changes = FillEngine.fill(source: source, target: target, cells: sheet.cells)
+        guard !changes.isEmpty else { return }
+        apply(changes, name: "Fill",
+              selectionAfter: SheetSelection(anchor: target.start, active: target.end))
+    }
+
+    // MARK: - Clipboard
+
+    /// Puts the selection on the pasteboard, as rich cells and as tab-separated text.
+    ///
+    /// - Parameter cut: records where the block came from so the next paste can clear it. Nothing
+    ///   is removed here — see ``cutSource``.
+    func copySelection(cut: Bool = false) {
+        guard let sheet = activeSheet, let selection else { return }
+        guard !cut || isEditable else { return }
+
+        let range = selection.range
+        let clipboard = SheetClipboard(range: range, cells: sheet.cells, isCut: cut)
+        let payload = try? JSONEncoder().encode(clipboard)
+        pasteboard.write(payload: payload, text: clipboard.tabSeparatedText)
+        cutSource = cut ? (activeSheetIndex, range) : nil
+        show(notice: cut ? "Cut \(range.address)" : "Copied \(range.address)")
+    }
+
+    /// Writes the clipboard into the selection.
+    ///
+    /// A selection larger than the copied block tiles it; a single-cell selection pastes the block
+    /// at its own size. If the block was cut from this workbook, the source cells are cleared as
+    /// part of the *same* edit, so one undo puts both ends back.
+    func paste() {
+        guard isEditable, let selection, let sheet = activeSheet else { return }
+        guard let clipboard = readClipboard() else {
+            show(notice: "Nothing to paste")
+            return
+        }
+
+        let target = clipboard.target(at: selection.range.start, into: selection.range)
+        let destination = clipboard.changes(at: selection.range.start, into: selection.range,
+                                            existing: sheet.cells)
+        guard !destination.isEmpty else { return }
+
+        var bySheet: [Int: CellChanges] = [activeSheetIndex: destination]
+        if clipboard.isCut, let cutSource {
+            var cleared = CellChanges()
+            for address in cutSource.range.addresses {
+                // A block cut and pasted over itself must keep what the paste wrote, so the clear
+                // only covers the cells the paste is not writing.
+                if cutSource.sheetIndex == activeSheetIndex,
+                   destination.index(forKey: address.id) != nil { continue }
+                cleared.updateValue(nil, forKey: address.id)
+            }
+            bySheet[cutSource.sheetIndex] = bySheet[cutSource.sheetIndex]
+                .map { $0.merging(cleared) { current, _ in current } } ?? cleared
+        }
+
+        apply(bySheet, name: "Paste",
+              selectionAfter: SheetSelection(anchor: target.start, active: target.end))
+
+        if clipboard.isCut {
+            cutSource = nil
+            pasteboard.write(payload: nil, text: clipboard.tabSeparatedText)
+        }
+        let pastedAFormula = destination.values.contains { cell in
+            guard let raw = cell?.raw else { return false }
+            return FormulaReferences.isFormula(raw)
+        }
+        if pastedAFormula {
+            show(notice: "Pasted formulas recalculate when the sheet is opened on the web")
+        }
+    }
+
+    /// Prefers this app's own payload, falling back to whatever text another app left.
+    private func readClipboard() -> SheetClipboard? {
+        if let payload = pasteboard.readPayload(),
+           let clipboard = try? JSONDecoder().decode(SheetClipboard.self, from: payload) {
+            return clipboard
+        }
+        guard let text = pasteboard.readText(), !text.isEmpty else { return nil }
+        return SheetClipboard.fromTabSeparated(text)
+    }
+
+    // MARK: - Undo / redo
+
+    func undo() {
+        guard let edit = history.undo() else { return }
+        write(edit.before)
+        activeSheetIndex = edit.sheetBefore
+        selection = edit.selectionBefore
+        historyToken &+= 1
+        hasUnsavedChanges = true
+    }
+
+    func redo() {
+        guard let edit = history.redo() else { return }
+        write(edit.after)
+        activeSheetIndex = edit.sheetAfter
+        selection = edit.selectionAfter
+        historyToken &+= 1
+        hasUnsavedChanges = true
+    }
+
+    // MARK: - Applying changes
+
+    /// The single funnel every edit passes through.
+    ///
+    /// Reads the cells being written *before* writing them, so the undo entry costs one dictionary
+    /// lookup per changed cell rather than a copy of the tab. A change that writes what is already
+    /// there is dropped, which keeps a no-op edit — retyping the same value, pasting a block over
+    /// its own copy — out of the history and off the save queue.
+    private func apply(_ changes: CellChanges, name: String, selectionAfter: SheetSelection? = nil) {
+        apply([activeSheetIndex: changes], name: name, selectionAfter: selectionAfter)
+    }
+
+    private func apply(_ changes: [Int: CellChanges], name: String,
+                       selectionAfter: SheetSelection? = nil) {
+        guard isEditable, var file else { return }
+
+        var before: [Int: CellChanges] = [:]
+        var after: [Int: CellChanges] = [:]
+
+        for (sheetIndex, sheetChanges) in changes {
+            guard file.sheets.indices.contains(sheetIndex) else { continue }
+            var sheet = file.sheets[sheetIndex]
+            var sheetBefore = CellChanges()
+            var sheetAfter = CellChanges()
+
+            for (id, newCell) in sheetChanges {
+                let oldCell = sheet.cells[id]
+                guard oldCell != newCell else { continue }
+                sheetBefore.updateValue(oldCell, forKey: id)
+                sheetAfter.updateValue(newCell, forKey: id)
+                if let newCell {
+                    sheet.cells[id] = newCell
+                } else {
+                    sheet.cells.removeValue(forKey: id)
+                }
+            }
+
+            guard !sheetAfter.isEmpty else { continue }
+            file.sheets[sheetIndex] = sheet
+            before[sheetIndex] = sheetBefore
+            after[sheetIndex] = sheetAfter
+        }
+
+        guard !after.isEmpty else { return }
+        self.file = file
+
+        history.record(WorkbookEdit(before: before, after: after,
+                                    sheetBefore: activeSheetIndex, sheetAfter: activeSheetIndex,
+                                    selectionBefore: selection,
+                                    selectionAfter: selectionAfter ?? selection,
+                                    name: name))
+        historyToken &+= 1
+        if let selectionAfter { selection = selectionAfter }
+        hasUnsavedChanges = true
+    }
+
+    /// Writes cells without recording history — the undo and redo path.
+    private func write(_ changes: [Int: CellChanges]) {
+        guard var file else { return }
+        for (sheetIndex, sheetChanges) in changes {
+            guard file.sheets.indices.contains(sheetIndex) else { continue }
+            var sheet = file.sheets[sheetIndex]
+            for (id, cell) in sheetChanges {
+                if let cell {
+                    sheet.cells[id] = cell
+                } else {
+                    sheet.cells.removeValue(forKey: id)
+                }
+            }
+            file.sheets[sheetIndex] = sheet
+        }
+        self.file = file
+    }
+
+    // MARK: - Notices
+
+    private func show(notice message: String) {
+        notice = message
+        noticeTask?.cancel()
+        noticeTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.notice = nil
+        }
     }
 
     // MARK: - Saving
@@ -258,6 +516,10 @@ final class SheetEditorModel: ObservableObject {
         conflict = nil
         file = nil
         hasUnsavedChanges = false
+        // The history describes cells that are about to be replaced wholesale; undoing into them
+        // afterwards would write this device's discarded edits back over the server's copy.
+        history.clear()
+        historyToken &+= 1
         await load()
     }
 

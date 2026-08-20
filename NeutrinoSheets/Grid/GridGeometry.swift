@@ -154,6 +154,32 @@ struct GridGeometry {
         return CGRect(x: origin.x, y: origin.y, width: right - origin.x, height: bottom - origin.y)
     }
 
+    /// How many cells of a selection are scanned for merges reaching out of it.
+    ///
+    /// The scan runs inside `draw(_:)`, so it is on the frame loop. A selection of a few hundred
+    /// cells costs a few hundred dictionary lookups and is free at this scale; a selection of a
+    /// whole column is 65,536 of them *per frame* and would turn scrolling into a slideshow. Past
+    /// the limit the outline is drawn on the plain rectangle — a merge straddling the edge of a
+    /// selection that large is a pixel nobody can see.
+    private static let mergeScanLimit = 1024
+
+    /// The rectangle a whole range occupies, widened to cover any merge that reaches out of it.
+    ///
+    /// Shared by the renderer and by the fill handle's hit testing, which have to agree: a handle
+    /// drawn at one corner and grabbable at another is a handle that does not work.
+    func rect(for range: CellRange, cells: [String: SavedCell]?) -> CGRect {
+        var rect = self.rect(for: range.start,
+                             colSpan: range.columnCount, rowSpan: range.rowCount)
+        guard let cells, !cells.isEmpty, range.cellCount <= Self.mergeScanLimit else { return rect }
+        for address in range.addresses {
+            guard let cell = cells[address.id],
+                  (cell.colSpan ?? 1) > 1 || (cell.rowSpan ?? 1) > 1 else { continue }
+            rect = rect.union(self.rect(for: address,
+                                        colSpan: cell.colSpan ?? 1, rowSpan: cell.rowSpan ?? 1))
+        }
+        return rect
+    }
+
     // MARK: - Hit testing
 
     /// The cell containing a point in content coordinates. Points above or left of the grid clamp
