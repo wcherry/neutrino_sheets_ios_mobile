@@ -243,6 +243,109 @@ final class SheetEditorModel: ObservableObject {
         FormulaReferences.isFormula(text)
     }
 
+    // MARK: - Formatting
+
+    /// Epic 9 — the style the format controls show as current.
+    ///
+    /// Read from the active cell rather than reconciled across the whole selection: a range whose
+    /// cells disagree has no single answer, and the web app's toolbar reads its anchor for exactly
+    /// that reason. The active cell is the one the formula bar is editing, so it is the one the
+    /// user is looking at.
+    var selectionStyle: CellStyle? { selectedCell?.cellStyle }
+
+    /// True when the selection's top-left cell is a merge anchor, so the control reads "Unmerge".
+    var isSelectionMerged: Bool {
+        guard let selection, let sheet = activeSheet else { return false }
+        return MergeEngine.mergeOrigin(at: selection.range.start, cells: sheet.cells) != nil
+    }
+
+    /// The table regions on the active tab.
+    var tableRegions: [TableRegion] { activeSheet?.tables ?? [] }
+
+    /// Applies one style patch to every cell in the selection.
+    ///
+    /// A patch can land on a cell that holds nothing, and that is deliberate: formatting an empty
+    /// range is how a user prepares a table before typing into it, and the web app stores those
+    /// cells too. What is *not* stored is a cell the patch leaves with no style and no content —
+    /// clearing formatting from an empty cell removes the key rather than leaving `{"id":"B2"}`
+    /// behind.
+    func applyStyle(_ patch: CellStylePatch, name: String) {
+        guard isEditable, let sheet = activeSheet, let selection, !patch.isEmpty else { return }
+        var changes = CellChanges()
+        for address in selection.range.addresses {
+            var cell = sheet.cells[address.id] ?? SavedCell(id: address.id)
+            cell.cellStyle = patch.applied(to: cell.cellStyle)
+            changes.updateValue(cell.isEmpty ? nil : cell, forKey: address.id)
+        }
+        apply(changes, name: name)
+    }
+
+    /// Applies a different patch per cell — what a table style produces. One undo entry covers the
+    /// whole block, because applying a table style is one act.
+    func applyStyles(_ patches: [String: CellStylePatch], name: String,
+                     tables: [TableRegion]? = nil) {
+        guard isEditable, let sheet = activeSheet else { return }
+        var changes = CellChanges()
+        for (id, patch) in patches {
+            var cell = sheet.cells[id] ?? SavedCell(id: id)
+            cell.cellStyle = patch.applied(to: cell.cellStyle)
+            changes.updateValue(cell.isEmpty ? nil : cell, forKey: id)
+        }
+        apply([activeSheetIndex: changes], name: name,
+              tables: tables.map { [activeSheetIndex: $0] } ?? [:])
+    }
+
+    /// Epic 9 — "Clear formatting". Values are kept; ``clearSelection()`` is the other half.
+    func clearFormatting() {
+        applyStyle(.clearFormatting, name: "Clear Formatting")
+    }
+
+    /// Epic 9 — "Merge / unmerge".
+    ///
+    /// One command rather than two, matching the web app's single toolbar button: the selection
+    /// either starts on a merge anchor, in which case the only sensible act is to split it, or it
+    /// does not, in which case it is a range asking to be joined.
+    func toggleMerge() {
+        guard isEditable, let sheet = activeSheet, let selection else { return }
+
+        if let origin = MergeEngine.mergeOrigin(at: selection.range.start, cells: sheet.cells) {
+            // Selecting the whole block afterwards shows what was just split, which is otherwise
+            // invisible — the cells look identical until you notice the borders.
+            apply(MergeEngine.unmerge(origin, cells: sheet.cells), name: "Unmerge",
+                  selectionAfter: SheetSelection(anchor: origin.start, active: origin.end))
+        } else {
+            let range = selection.range
+            guard range.cellCount > 1 else { return }
+            apply(MergeEngine.merge(range, cells: sheet.cells), name: "Merge",
+                  selectionAfter: SheetSelection(range.start))
+        }
+    }
+
+    /// Epic 9 — "Table style gallery and table regions".
+    ///
+    /// Applying a style does two things: it writes ordinary cell styles, which is what makes the
+    /// banding visible in both clients, and it records a ``TableRegion``, which is what lets a
+    /// client that understands structural edits re-band the range after a row is inserted. The
+    /// "Blank" entry does the inverse of both.
+    func applyTableStyle(_ style: TableStyle) {
+        guard isEditable, let sheet = activeSheet, let selection else { return }
+        let range = selection.range
+        let existing = sheet.tables ?? []
+
+        switch style.kind {
+        case .blank:
+            let patches = Dictionary(uniqueKeysWithValues:
+                range.addresses.map { ($0.id, CellStylePatch.clearFormatting) })
+            applyStyles(patches, name: "Clear Table Style",
+                        tables: existing.removingOverlaps(with: range))
+
+        case .regular(let regular):
+            let region = TableRegion(id: TableRegion.makeID(), styleId: style.id, range: range)
+            applyStyles(TableStyles.patches(for: regular, in: range), name: "Table Style",
+                        tables: existing.registering(region))
+        }
+    }
+
     // MARK: - Fill
 
     /// Epic 8 — the fill handle. Extends the selection's cells across `target`, which must contain
@@ -335,7 +438,7 @@ final class SheetEditorModel: ObservableObject {
 
     func undo() {
         guard let edit = history.undo() else { return }
-        write(edit.before)
+        write(edit.before, tables: edit.tablesBefore)
         activeSheetIndex = edit.sheetBefore
         selection = edit.selectionBefore
         historyToken &+= 1
@@ -344,7 +447,7 @@ final class SheetEditorModel: ObservableObject {
 
     func redo() {
         guard let edit = history.redo() else { return }
-        write(edit.after)
+        write(edit.after, tables: edit.tablesAfter)
         activeSheetIndex = edit.sheetAfter
         selection = edit.selectionAfter
         historyToken &+= 1
@@ -363,7 +466,10 @@ final class SheetEditorModel: ObservableObject {
         apply([activeSheetIndex: changes], name: name, selectionAfter: selectionAfter)
     }
 
+    /// - Parameter tables: the ``TableRegion`` list a tab should end up with, for the edits that
+    ///   change it. A tab absent from the map keeps whatever it had.
     private func apply(_ changes: [Int: CellChanges], name: String,
+                       tables: [Int: [TableRegion]] = [:],
                        selectionAfter: SheetSelection? = nil) {
         guard isEditable, var file else { return }
 
@@ -394,10 +500,26 @@ final class SheetEditorModel: ObservableObject {
             after[sheetIndex] = sheetAfter
         }
 
-        guard !after.isEmpty else { return }
+        var tablesBefore: [Int: [TableRegion]] = [:]
+        var tablesAfter: [Int: [TableRegion]] = [:]
+        for (sheetIndex, regions) in tables {
+            guard file.sheets.indices.contains(sheetIndex) else { continue }
+            let current = file.sheets[sheetIndex].tables ?? []
+            guard current != regions else { continue }
+            tablesBefore[sheetIndex] = current
+            tablesAfter[sheetIndex] = regions
+            // An empty list is written back as an absent key, so a workbook that never had tables
+            // does not gain `"tables":[]` the first time one is cleared.
+            file.sheets[sheetIndex].tables = regions.isEmpty ? nil : regions
+        }
+
+        // A table style whose colours are already on the cells still has a region to record, so
+        // "nothing changed" has to mean neither half changed.
+        guard !after.isEmpty || !tablesAfter.isEmpty else { return }
         self.file = file
 
         history.record(WorkbookEdit(before: before, after: after,
+                                    tablesBefore: tablesBefore, tablesAfter: tablesAfter,
                                     sheetBefore: activeSheetIndex, sheetAfter: activeSheetIndex,
                                     selectionBefore: selection,
                                     selectionAfter: selectionAfter ?? selection,
@@ -408,7 +530,7 @@ final class SheetEditorModel: ObservableObject {
     }
 
     /// Writes cells without recording history — the undo and redo path.
-    private func write(_ changes: [Int: CellChanges]) {
+    private func write(_ changes: [Int: CellChanges], tables: [Int: [TableRegion]] = [:]) {
         guard var file else { return }
         for (sheetIndex, sheetChanges) in changes {
             guard file.sheets.indices.contains(sheetIndex) else { continue }
@@ -421,6 +543,10 @@ final class SheetEditorModel: ObservableObject {
                 }
             }
             file.sheets[sheetIndex] = sheet
+        }
+        for (sheetIndex, regions) in tables {
+            guard file.sheets.indices.contains(sheetIndex) else { continue }
+            file.sheets[sheetIndex].tables = regions.isEmpty ? nil : regions
         }
         self.file = file
     }

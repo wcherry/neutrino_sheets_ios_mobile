@@ -32,6 +32,17 @@ enum FeatureFlags {
     /// anything here being able to change it.
     static let cellEditing: Bool = true
 
+    // MARK: - Phase 2
+
+    /// Epic 9 — cell formatting: the format bar, the format sheet, borders, number formats, merge
+    /// and the table-style gallery.
+    ///
+    /// Switching this off leaves Epic 8's editor: values can still be typed, filled and pasted, and
+    /// the workbook's existing styles still render. It does not switch editing *on* — every
+    /// formatting command goes through the same guard a value edit does, so a read-only share and a
+    /// build with ``cellEditing`` off are both unaffected by this flag.
+    static let formatting: Bool = true
+
     /// Epic 25 — accepting inbound `https://www.getneutrino.app/open/sheet/<id>` Universal Links.
     ///
     /// Off, and deliberately: the deployed `apple-app-site-association` still routes `/open/sheet/*`

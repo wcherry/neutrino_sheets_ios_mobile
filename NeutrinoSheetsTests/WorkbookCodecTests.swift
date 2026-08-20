@@ -127,6 +127,77 @@ final class WorkbookCodecTests: XCTestCase {
         XCTAssertNotNil(cells["A2"])
     }
 
+    // MARK: - Table regions (Epic 9)
+
+    /// `tables` was preserved opaquely until Epic 9 needed to write one. Claiming a key that used
+    /// to be carried is the one migration `UnknownFields` is built to survive, and this is what
+    /// says it did: the fixture's region comes back typed, with its bounds intact.
+    func testDecodesTableRegionsAsTypedValues() throws {
+        let file = SheetFile.decode(from: Data(webWorkbookJSON.utf8))
+        let region = try XCTUnwrap(file.sheets[0].tables?.first)
+
+        XCTAssertEqual(region.id, "t-1")
+        XCTAssertEqual(region.styleId, "blue")
+        XCTAssertEqual(region.range.address, "A1:B9")
+        XCTAssertNil(file.sheets[1].tables)
+    }
+
+    func testTableRegionsSurviveAReEncode() throws {
+        let file = SheetFile.decode(from: Data(webWorkbookJSON.utf8))
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try file.encoded()) as? [String: Any]
+        )
+        let sheets = try XCTUnwrap(object["sheets"] as? [[String: Any]])
+        let tables = try XCTUnwrap(sheets[0]["tables"] as? [[String: Any]])
+
+        XCTAssertEqual(tables.count, 1)
+        XCTAssertEqual(tables[0]["id"] as? String, "t-1")
+        XCTAssertEqual(tables[0]["minC"] as? Int, 1)
+        XCTAssertEqual(tables[0]["maxR"] as? Int, 9)
+    }
+
+    /// Forward compatibility one level down: a field a later web release adds *inside* a region is
+    /// carried the same way a field it adds to a sheet is.
+    func testPreservesUnknownFieldsInsideATableRegion() throws {
+        let json = #"""
+        {"sheets":[{"cells":{},"tables":[
+          {"id":"t-1","styleId":"blue-banded","minR":1,"maxR":4,"minC":1,"maxC":2,
+           "headerLabels":["Item","Cost"]}]}]}
+        """#
+        let file = SheetFile.decode(from: Data(json.utf8))
+        XCTAssertEqual(file.sheets[0].tables?.first?.styleId, "blue-banded")
+
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try file.encoded()) as? [String: Any]
+        )
+        let sheets = try XCTUnwrap(object["sheets"] as? [[String: Any]])
+        let tables = try XCTUnwrap(sheets[0]["tables"] as? [[String: Any]])
+        XCTAssertEqual(tables[0]["headerLabels"] as? [String], ["Item", "Cost"])
+    }
+
+    /// A `tables` value in a shape this app cannot read falls back to the opaque path rather than
+    /// being dropped. Losing it would not fail anywhere — the range would simply stop being a table
+    /// the next time the web app tried to re-band it.
+    func testAnUnreadableTablesValueIsStillWrittenBack() throws {
+        let json = #"{"sheets":[{"cells":{},"tables":{"legacy":"shape"}}]}"#
+        let file = SheetFile.decode(from: Data(json.utf8))
+        XCTAssertNil(file.sheets[0].tables)
+
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try file.encoded()) as? [String: Any]
+        )
+        let sheets = try XCTUnwrap(object["sheets"] as? [[String: Any]])
+        let tables = try XCTUnwrap(sheets[0]["tables"] as? [String: Any])
+        XCTAssertEqual(tables["legacy"] as? String, "shape")
+    }
+
+    func testDoesNotEmitAnEmptyTablesArray() throws {
+        let file = SheetFile(sheets: [SheetData(name: "Sheet1", tables: [])])
+        let text = String(decoding: try file.encoded(), as: UTF8.self)
+
+        XCTAssertFalse(text.contains("tables"), text)
+    }
+
     func testPreservesUnknownTopLevelKeys() throws {
         let json = #"{"sheets":[{"cells":{}}],"schemaVersion":3,"lastEditor":"web"}"#
         let file = SheetFile.decode(from: Data(json.utf8))

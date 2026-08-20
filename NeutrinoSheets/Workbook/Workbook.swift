@@ -150,9 +150,14 @@ struct SavedCell: Codable, Hashable {
 
 /// One tab of a workbook, mirroring `SheetData` in the web app's `types.ts`.
 ///
-/// `charts`, `conditionalFormats`, `cfVariables` and `tables` are *not* modelled. They are carried
-/// in ``unknownFields`` and written back byte-for-byte, because Phase 1 cannot render them and a
-/// typed model this app never reads would only be a way to lose them. See ``UnknownFields``.
+/// `charts`, `conditionalFormats` and `cfVariables` are *not* modelled. They are carried in
+/// ``unknownFields`` and written back byte-for-byte, because this app cannot render them and a
+/// typed model it never reads would only be a way to lose them. See ``UnknownFields``.
+///
+/// `tables` was preserved the same way until Epic 9, which applies table styles and so has to be
+/// able to *write* a region rather than only carry one. Claiming a preserved key is the one case
+/// ``UnknownFields`` is designed to survive: the typed value wins, and it is the right winner
+/// because it is the one the user just edited.
 struct SheetData: Hashable {
 
     // MARK: - Properties
@@ -168,21 +173,25 @@ struct SheetData: Hashable {
     var colWidths: [String: Double]?
     /// Pixel heights keyed by **stringified 0-based row index**.
     var rowHeights: [String: Double]?
+    /// Epic 9 — the ranges a table style has been applied to. See ``TableRegion``.
+    var tables: [TableRegion]?
 
     /// Everything the web app writes that this app does not model — charts, conditional formats, CF
-    /// variables, table regions, and anything a future web release adds.
+    /// variables, and anything a future web release adds.
     var unknownFields: UnknownFields
 
     // MARK: - Init
 
     init(name: String? = nil, color: String? = nil, cells: [String: SavedCell] = [:],
          colWidths: [String: Double]? = nil, rowHeights: [String: Double]? = nil,
+         tables: [TableRegion]? = nil,
          unknownFields: UnknownFields = UnknownFields()) {
         self.name = name
         self.color = color
         self.cells = cells
         self.colWidths = colWidths
         self.rowHeights = rowHeights
+        self.tables = tables
         self.unknownFields = unknownFields
     }
 
@@ -215,10 +224,11 @@ struct SheetData: Hashable {
 extension SheetData: Codable {
 
     /// The keys this type owns. Anything else is preserved opaquely.
-    static let knownKeys: Set<String> = ["name", "color", "cells", "colWidths", "rowHeights"]
+    static let knownKeys: Set<String> = ["name", "color", "cells", "colWidths", "rowHeights",
+                                         "tables"]
 
     private enum CodingKeys: String, CodingKey {
-        case name, color, cells, colWidths, rowHeights
+        case name, color, cells, colWidths, rowHeights, tables
     }
 
     init(from decoder: any Decoder) throws {
@@ -230,7 +240,14 @@ extension SheetData: Codable {
         cells = try container.decodeIfPresent([String: SavedCell].self, forKey: .cells) ?? [:]
         colWidths = try container.decodeIfPresent([String: Double].self, forKey: .colWidths)
         rowHeights = try container.decodeIfPresent([String: Double].self, forKey: .rowHeights)
-        unknownFields = try UnknownFields(from: decoder, excluding: Self.knownKeys)
+        // A `tables` array this app cannot read must not stop the workbook opening, and must not be
+        // thrown away either: it falls back to the opaque path, so it is written out again exactly
+        // as it arrived. Anything else would be a save that loses a range's table identity without
+        // failing anywhere.
+        tables = try? container.decodeIfPresent([TableRegion].self, forKey: .tables)
+        unknownFields = try UnknownFields(from: decoder,
+                                          excluding: tables == nil ? Self.knownKeys.subtracting(["tables"])
+                                                                   : Self.knownKeys)
     }
 
     func encode(to encoder: any Encoder) throws {
@@ -243,7 +260,13 @@ extension SheetData: Codable {
         try container.encode(cells, forKey: .cells)
         try container.encodeIfPresent(colWidths?.isEmpty == true ? nil : colWidths, forKey: .colWidths)
         try container.encodeIfPresent(rowHeights?.isEmpty == true ? nil : rowHeights, forKey: .rowHeights)
-        try unknownFields.encode(to: encoder, excluding: Self.knownKeys)
+        try container.encodeIfPresent(tables?.isEmpty == true ? nil : tables, forKey: .tables)
+        // `tables` is excluded from the opaque pass only when this app holds a typed value for it.
+        // When it does not — an array in a shape a later web release invented — the preserved copy
+        // is what gets written, and dropping it here would be the very loss it was kept against.
+        try unknownFields.encode(to: encoder,
+                                 excluding: tables == nil ? Self.knownKeys.subtracting(["tables"])
+                                                          : Self.knownKeys)
     }
 }
 
