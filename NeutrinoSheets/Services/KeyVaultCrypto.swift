@@ -1,6 +1,7 @@
 import Foundation
 import CryptoKit
 import Sodium
+import NeutrinoCrypto
 
 // MARK: - KeyVaultCrypto
 //

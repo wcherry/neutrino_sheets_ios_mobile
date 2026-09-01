@@ -36,6 +36,12 @@ struct SheetEditorView: View {
     @State private var formulaWarning = false
     /// Epic 9 — the full formatting sheet, opened from the format bar or the actions menu.
     @State private var showFormatSheet = false
+    /// Epic 10 — find & replace, the per-column filter list, and the two tab dialogs. Each holds
+    /// what it is *about* rather than a bare flag, so the sheet cannot open pointing at nothing.
+    @State private var showFindReplace = false
+    @State private var filterColumn: GridIndex?
+    @State private var renamingTab: GridIndex?
+    @State private var colouringTab: GridIndex?
 
     // MARK: - Init
 
@@ -76,6 +82,34 @@ struct SheetEditorView: View {
                             selectionAddress: model.selection?.address ?? "",
                             perform: perform)
             }
+            .sheet(isPresented: $showFindReplace) {
+                FindReplaceView(model: model)
+            }
+            .sheet(item: $filterColumn) { target in
+                ColumnFilterView(column: target.id,
+                                 values: model.filterValues(inColumn: target.id),
+                                 current: model.columnFilters.allowed[target.id]) { values in
+                    model.setFilter(values, forColumn: target.id)
+                }
+            }
+            // Both index into the tab list, which an undo or a delete can shorten while the sheet
+            // is up, so both check the index still exists rather than trapping on it.
+            .sheet(item: $renamingTab) { target in
+                if model.sheetNames.indices.contains(target.id) {
+                    SheetTabRenameView(currentName: model.sheetNames[target.id]) { name in
+                        model.renameSheet(at: target.id, to: name)
+                        model.saveIfNeeded()
+                    }
+                }
+            }
+            .sheet(item: $colouringTab) { target in
+                if let sheets = model.file?.sheets, sheets.indices.contains(target.id) {
+                    SheetTabColorView(current: sheets[target.id].color) { color in
+                        model.setSheetColor(color, at: target.id)
+                        model.saveIfNeeded()
+                    }
+                }
+            }
             .alert("Formulas aren\u{2019}t supported yet", isPresented: $formulaWarning) {
                 Button("OK", role: .cancel) { }
             } message: {
@@ -106,12 +140,17 @@ struct SheetEditorView: View {
                     selection: $model.selection,
                     metrics: settings.gridMetrics,
                     showGridLines: settings.showGridLines,
+                    frozen: model.frozen,
+                    hiddenRows: model.filteredRows,
+                    filteredColumns: Set(model.columnFilters.columns),
+                    allowsStructure: FeatureFlags.structure,
                     isEditable: model.isEditable,
                     isEditingCell: editingText != nil,
                     canPaste: model.canPaste,
                     onActivate: beginEditing,
                     onFill: { model.fill(to: $0) },
-                    onCommand: perform
+                    onCommand: perform,
+                    onStructure: perform
                 )
 
                 // Epic 9 — the format bar sits under the grid rather than over it: it is used with
@@ -125,7 +164,9 @@ struct SheetEditorView: View {
                               onMore: { showFormatSheet = true })
                 }
 
-                if model.sheetNames.count > 1 {
+                // Epic 10 gives the bar an "add" button, so it earns its place on a one-tab
+                // workbook too — a second tab has to be reachable from somewhere.
+                if model.sheetNames.count > 1 || model.isEditable {
                     Divider()
                     tabBar
                 }
@@ -195,16 +236,20 @@ struct SheetEditorView: View {
 
     // MARK: - Tab bar
 
-    /// Epic 6 — "Tab bar for multi-sheet workbooks". Read-only in Phase 1; adding, renaming and
-    /// reordering tabs is Epic 10.
+    /// Epic 6 — "Tab bar for multi-sheet workbooks"; Epic 10 — "Add / rename / colour / reorder /
+    /// duplicate / delete sheet tabs".
+    ///
+    /// Every tab operation lives in a long-press menu on the tab itself rather than in the actions
+    /// menu at the top. A tab command is *about* one tab, and on a phone the shortest way to say
+    /// which one is to press it — the alternative is a menu that first asks you to pick a tab from
+    /// a list of the tabs already on screen.
     private var tabBar: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 4) {
                 ForEach(Array(model.sheetNames.enumerated()), id: \.offset) { index, name in
                     Button {
                         cancelEditing()
-                        model.activeSheetIndex = index
-                        model.selection = SheetSelection(CellAddress(column: 1, row: 1))
+                        model.selectSheet(at: index)
                     } label: {
                         HStack(spacing: 6) {
                             if let color = tabColor(at: index) {
@@ -223,12 +268,79 @@ struct SheetEditorView: View {
                         )
                         .foregroundStyle(index == model.activeSheetIndex ? Color.accentColor : Color.secondary)
                     }
+                    .contextMenu { tabMenu(at: index) }
+                }
+
+                if model.isEditable {
+                    Button {
+                        cancelEditing()
+                        model.addSheet()
+                        model.saveIfNeeded()
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.footnote.weight(.semibold))
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 7)
+                    }
+                    .accessibilityLabel("Add sheet")
                 }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
         }
         .background(Color(.secondarySystemBackground))
+    }
+
+    @ViewBuilder
+    private func tabMenu(at index: Int) -> some View {
+        if model.isEditable {
+            Section {
+                Button {
+                    renamingTab = GridIndex(id: index)
+                } label: {
+                    Label("Rename", systemImage: "pencil")
+                }
+                Button {
+                    colouringTab = GridIndex(id: index)
+                } label: {
+                    Label("Colour\u{2026}", systemImage: "paintpalette")
+                }
+                Button {
+                    model.duplicateSheet(at: index)
+                    model.saveIfNeeded()
+                } label: {
+                    Label("Duplicate", systemImage: "doc.on.doc")
+                }
+            }
+
+            Section {
+                Button {
+                    model.moveSheet(at: index, by: -1)
+                    model.saveIfNeeded()
+                } label: {
+                    Label("Move Left", systemImage: "arrow.left")
+                }
+                .disabled(index == 0)
+
+                Button {
+                    model.moveSheet(at: index, by: 1)
+                    model.saveIfNeeded()
+                } label: {
+                    Label("Move Right", systemImage: "arrow.right")
+                }
+                .disabled(index == model.sheetNames.count - 1)
+            }
+
+            Section {
+                Button(role: .destructive) {
+                    model.deleteSheet(at: index)
+                    model.saveIfNeeded()
+                } label: {
+                    Label("Delete", systemImage: "trash")
+                }
+                .disabled(!model.canDeleteSheet)
+            }
+        }
     }
 
     private func tabColor(at index: Int) -> Color? {
@@ -391,6 +503,31 @@ struct SheetEditorView: View {
                             }
                         }
                     }
+
+                    // Epic 10. The header menu is the quicker route to all of this, but it is only
+                    // reachable by pressing a header — and a user who has not discovered that needs
+                    // somewhere to find "insert a row" that they already know about.
+                    if FeatureFlags.structure && model.isEditable {
+                        structureSection
+                    }
+                }
+
+                if FeatureFlags.structure {
+                    Section {
+                        Button {
+                            showFindReplace = true
+                        } label: {
+                            Label("Find & Replace\u{2026}", systemImage: "magnifyingglass")
+                        }
+
+                        if !model.columnFilters.isEmpty {
+                            Button {
+                                model.clearAllFilters()
+                            } label: {
+                                Label("Clear All Filters", systemImage: "line.3.horizontal.decrease")
+                            }
+                        }
+                    }
                 }
 
                 Section {
@@ -413,6 +550,65 @@ struct SheetEditorView: View {
                 Image(systemName: "ellipsis.circle")
             }
             .accessibilityLabel("Actions")
+        }
+    }
+
+    /// Epic 10 — the structural commands, mirroring the header menu.
+    @ViewBuilder
+    private var structureSection: some View {
+        Section {
+            Menu {
+                Button { perform(.insertRows(before: true)) } label: {
+                    Label("Rows Above", systemImage: "arrow.up")
+                }
+                Button { perform(.insertRows(before: false)) } label: {
+                    Label("Rows Below", systemImage: "arrow.down")
+                }
+                Button { perform(.insertColumns(before: true)) } label: {
+                    Label("Columns Left", systemImage: "arrow.left")
+                }
+                Button { perform(.insertColumns(before: false)) } label: {
+                    Label("Columns Right", systemImage: "arrow.right")
+                }
+            } label: {
+                Label("Insert", systemImage: "plus.rectangle")
+            }
+
+            Menu {
+                Button(role: .destructive) { perform(.deleteRows) } label: {
+                    Label("Rows", systemImage: "trash")
+                }
+                Button(role: .destructive) { perform(.deleteColumns) } label: {
+                    Label("Columns", systemImage: "trash")
+                }
+            } label: {
+                Label("Delete", systemImage: "minus.rectangle")
+            }
+
+            Menu {
+                Button { perform(.hideRows) } label: {
+                    Label("Hide Rows", systemImage: "eye.slash")
+                }
+                Button { perform(.hideColumns) } label: {
+                    Label("Hide Columns", systemImage: "eye.slash")
+                }
+                if model.hasHiddenRowsOrColumns {
+                    Button { model.showEverything(); model.saveIfNeeded() } label: {
+                        Label("Show All", systemImage: "eye")
+                    }
+                }
+                if model.frozen.isEmpty {
+                    Button { perform(.freezeToSelection) } label: {
+                        Label("Freeze Up To Selection", systemImage: "lock")
+                    }
+                } else {
+                    Button { perform(.unfreeze) } label: {
+                        Label("Unfreeze Panes", systemImage: "lock.open")
+                    }
+                }
+            } label: {
+                Label("View", systemImage: "rectangle.split.3x1")
+            }
         }
     }
 
@@ -465,6 +661,40 @@ struct SheetEditorView: View {
         case .toggleMerge:                model.toggleMerge()
         case .clearFormatting:            model.clearFormatting()
         case .tableStyle(let style):      model.applyTableStyle(style)
+        }
+        model.saveIfNeeded()
+    }
+
+    /// Epic 10 — the structural counterpart, from the header menu and the actions menu.
+    ///
+    /// `filter` and `clearFilter` are the two that are not edits: a filter changes how the workbook
+    /// is looked at, so neither queues a save, and `filter` only opens a sheet.
+    private func perform(_ command: StructureCommand) {
+        commitPendingEntry()
+        switch command {
+        case .insertRows(let before):     model.insertRows(before: before)
+        case .insertColumns(let before):  model.insertColumns(before: before)
+        case .deleteRows:                 model.deleteRows()
+        case .deleteColumns:              model.deleteColumns()
+        case .hideRows:                   model.hideRows()
+        case .hideColumns:                model.hideColumns()
+        case .show:                       model.showSelection()
+        case .sort(let column, let ascending):
+            model.sort(by: column, ascending: ascending)
+        case .resizeColumns(let columns, let width):
+            model.resize(columns: columns, to: width,
+                         name: columns.count > 1 ? "Resize Columns" : "Resize Column")
+        case .resizeRows(let rows, let height):
+            model.resize(rows: rows, to: height,
+                         name: rows.count > 1 ? "Resize Rows" : "Resize Row")
+        case .freezeToSelection:          model.freezeToSelection()
+        case .unfreeze:                   model.unfreeze()
+        case .filter(let column):
+            filterColumn = GridIndex(id: column)
+            return
+        case .clearFilter(let column):
+            model.setFilter(nil, forColumn: column)
+            return
         }
         model.saveIfNeeded()
     }

@@ -1,5 +1,8 @@
 import Foundation
 import os
+import NeutrinoCore
+import NeutrinoAuth
+import NeutrinoCrypto
 
 // MARK: - Wire types
 //
@@ -155,6 +158,11 @@ final class KeyVaultService {
         )
         KeyImportService.storeKeys(bundle)
         logger.info("unlock: vault opened via \(method, privacy: .public)")
+
+        // The vault holds one identity, the active one. Anything sealed to a version this account
+        // has rotated away from needs the key file, and this is the moment the key that opens it
+        // arrives. A failure is not fatal: the next launch retries the pull.
+        try? await KeyFileService.shared.restoreArchivedKeys(authService: authService)
 
         // Bookkeeping only — a failure here must not fail the unlock.
         await markUsed(unlockMethod.id)

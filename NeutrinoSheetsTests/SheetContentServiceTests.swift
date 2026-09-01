@@ -1,5 +1,6 @@
 import XCTest
 import Sodium
+import NeutrinoCore
 @testable import NeutrinoSheets
 
 /// Epic 7 — content load and save, and the client-side checks the drive refactor moved off the
@@ -32,8 +33,17 @@ final class SheetContentServiceTests: XCTestCase {
     // MARK: - Helpers
 
     /// Seals a DEK to the installed test key pair, as `PUT /files/{id}/key` would have stored it.
-    private func sealedKey(for dek: Bytes) throws -> String {
+    private func sealedKey(for dek: Bytes) throws -> SealedFileKey {
         try service.sealDEK(dek)
+    }
+
+    /// The key-ref JSON the server returns, version included.
+    ///
+    /// The version is written out rather than omitted: a stub without it would exercise only the
+    /// "read a missing version as 1" fallback and never the resolution it is there to cover.
+    private func keyRefJSON(for dek: Bytes) throws -> Data {
+        let key = try sealedKey(for: dek)
+        return Data("{\"encrypted_file_key\":\"\(key.sealed)\",\"key_version\":\(key.keyVersion)}".utf8)
     }
 
     private func encrypted(_ text: String, with dek: Bytes) throws -> Data {
@@ -175,7 +185,7 @@ final class SheetContentServiceTests: XCTestCase {
             }
             if path.hasSuffix("/info") { return ok(self.infoJSON()) }
             if path.hasSuffix("/key") {
-                return ok(Data("{\"encrypted_file_key\":\"\(try self.sealedKey(for: dek))\"}".utf8))
+                return ok(try self.keyRefJSON(for: dek))
             }
             return ok(try self.encrypted(workbook, with: dek))
         }
@@ -237,7 +247,7 @@ final class SheetContentServiceTests: XCTestCase {
             }
             if path.hasSuffix("/info") { return ok(self.infoJSON()) }
             if path.hasSuffix("/key") {
-                return ok(Data("{\"encrypted_file_key\":\"\(try self.sealedKey(for: storedDEK))\"}".utf8))
+                return ok(try self.keyRefJSON(for: storedDEK))
             }
             // Encrypted under a *different* key than the one the server hands back.
             return ok(try self.encrypted("{}", with: otherDEK))
@@ -378,7 +388,7 @@ final class SheetContentServiceTests: XCTestCase {
     func testSealedDEKRoundTrip() throws {
         let dek = Sodium().secretStream.xchacha20poly1305.key()
         let sealed = try service.sealDEK(dek)
-        XCTAssertEqual(try service.unsealDEK(sealed), dek)
+        XCTAssertEqual(try service.unsealDEK(sealed.sealed, keyVersion: sealed.keyVersion), dek)
     }
 
     func testDecryptRejectsATruncatedBody() {
