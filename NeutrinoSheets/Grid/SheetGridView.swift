@@ -9,6 +9,37 @@ enum GridCommand {
     case cut, copy, paste, clear, undo, redo
 }
 
+// MARK: - StructureCommand
+
+/// Epic 10 — a structural request raised from a row or column header.
+///
+/// Separate from ``GridCommand`` because these are the commands a header owns, and because two of
+/// them (`filter`, `clearFilter`) are not edits at all — they change how the workbook is *looked
+/// at*. Routing them all through one callback keeps the header menu, the actions menu and any
+/// future keyboard shortcut hitting the same code.
+enum StructureCommand: Equatable {
+    /// Insert as many rows as the selection covers, above it or below it.
+    case insertRows(before: Bool)
+    case insertColumns(before: Bool)
+    case deleteRows
+    case deleteColumns
+    case hideRows
+    case hideColumns
+    /// Put back whatever is hidden inside the selection.
+    case show
+    /// Sort by one column. Which rows move depends on the selection — see
+    /// ``SheetEditorModel/sort(by:ascending:)``.
+    case sort(column: Int, ascending: Bool)
+    /// Open the filter list for a column. Presented in SwiftUI, so the grid only asks.
+    case filter(column: Int)
+    case clearFilter(column: Int)
+    /// A resize drag that has finished. `size` is in points at the current zoom.
+    case resizeColumns(ClosedRange<Int>, Double)
+    case resizeRows(ClosedRange<Int>, Double)
+    case freezeToSelection
+    case unfreeze
+}
+
 // MARK: - SheetGridView
 
 /// The spreadsheet grid, hosted in SwiftUI.
@@ -26,6 +57,15 @@ struct SheetGridView: UIViewRepresentable {
     @Binding var selection: SheetSelection?
     var metrics: GridMetrics
     var showGridLines: Bool
+    /// Epic 10 — how many rows and columns stay put while the rest scrolls.
+    var frozen: FrozenPanes = FrozenPanes()
+    /// Epic 10 — 1-based rows a column filter is hiding, laid out at zero height.
+    var hiddenRows: Set<Int> = []
+    /// Epic 10 — the columns carrying a filter, marked in the header.
+    var filteredColumns: Set<Int> = []
+    /// Whether the headers offer their structural commands at all. Off leaves them as labels that
+    /// can still be tapped to select a whole row or column, which is not an edit.
+    var allowsStructure: Bool = true
     /// Whether the editing affordances — the fill handle, the edit menu's destructive items — are
     /// offered at all. A read-only share gets a viewer, not a disabled editor.
     var isEditable: Bool
@@ -40,6 +80,8 @@ struct SheetGridView: UIViewRepresentable {
     /// Called when the fill handle is released over `range`, which contains the selection.
     var onFill: (CellRange) -> Void = { _ in }
     var onCommand: (GridCommand) -> Void = { _ in }
+    /// Epic 10 — everything a row or column header asks for.
+    var onStructure: (StructureCommand) -> Void = { _ in }
 
     // MARK: - UIViewRepresentable
 
@@ -47,23 +89,31 @@ struct SheetGridView: UIViewRepresentable {
         let view = GridHostView()
         view.onSelect = { [weak coordinator = context.coordinator] in coordinator?.select($0) }
         configure(view, context: context)
-        view.apply(sheet: sheet, metrics: metrics, selection: selection, showGridLines: showGridLines)
+        apply(to: view)
         return view
     }
 
     func updateUIView(_ view: GridHostView, context: Context) {
         context.coordinator.selection = $selection
         configure(view, context: context)
-        view.apply(sheet: sheet, metrics: metrics, selection: selection, showGridLines: showGridLines)
+        apply(to: view)
+    }
+
+    private func apply(to view: GridHostView) {
+        view.apply(sheet: sheet, metrics: metrics, selection: selection,
+                   showGridLines: showGridLines, frozen: frozen, hiddenRows: hiddenRows,
+                   filteredColumns: filteredColumns)
     }
 
     private func configure(_ view: GridHostView, context: Context) {
         view.onActivate = onActivate
         view.onFill = onFill
         view.onCommand = onCommand
+        view.onStructure = onStructure
         view.isEditable = isEditable
         view.isEditingCell = isEditingCell
         view.canPaste = canPaste
+        view.allowsStructure = allowsStructure
     }
 
     func makeCoordinator() -> Coordinator {
@@ -116,11 +166,16 @@ final class GridHostView: UIView {
     var onActivate: (CellAddress) -> Void = { _ in }
     var onFill: (CellRange) -> Void = { _ in }
     var onCommand: (GridCommand) -> Void = { _ in }
+    var onStructure: (StructureCommand) -> Void = { _ in }
 
     // MARK: - Configuration
 
     var isEditable = false
     var canPaste = false
+    /// Epic 10's feature flag, reaching the one place it could otherwise be routed around: the
+    /// header menu and the resize drag are entry points of their own, not views a SwiftUI `if` can
+    /// leave out.
+    var allowsStructure = true
 
     /// Set while the formula bar is being typed into. The grid stops taking first responder then:
     /// a tap that dismissed the keyboard mid-value would lose whatever had been typed.
@@ -140,6 +195,19 @@ final class GridHostView: UIView {
     private let rowHeader = GridHeaderView(axis: .rows)
     private let cornerView = UIView()
 
+    /// Epic 10 — the three frozen panes, in the same order they are laid out: the block that never
+    /// moves, the band that scrolls sideways only, and the band that scrolls up and down only.
+    ///
+    /// They are siblings of the scroll view rather than subviews of it, so the content passes
+    /// *under* them. Each is an ordinary ``GridCanvasView`` handed a different content origin —
+    /// there is no second renderer, only a fourth and fifth and sixth window onto the same sheet.
+    private let frozenCorner = GridCanvasView()
+    private let frozenRowBand = GridCanvasView()
+    private let frozenColumnBand = GridCanvasView()
+    /// The hairlines that say where the frozen region ends.
+    private let frozenRowDivider = UIView()
+    private let frozenColumnDivider = UIView()
+
     // MARK: - State
 
     private var sheet: SheetData?
@@ -147,6 +215,13 @@ final class GridHostView: UIView {
     private var geometry: GridGeometry?
     private var selection: SheetSelection?
     private var showGridLines = true
+    private var frozen = FrozenPanes()
+    private var hiddenRows: Set<Int> = []
+
+    /// A resize drag in progress: the sheet is laid out with this size in place of the stored one,
+    /// so the column moves under the finger, and nothing is written until the finger lifts. Every
+    /// intermediate width would otherwise be an undo entry and a save.
+    private var resizePreview: (axis: GridHeaderView.Axis, index: Int, size: Double)?
 
     /// The zoom in progress, held separately so a pinch can be applied continuously and only
     /// committed to `baseMetrics` when the gesture ends.
@@ -171,6 +246,8 @@ final class GridHostView: UIView {
 
     private var fillPanGesture: UIPanGestureRecognizer?
     private lazy var editMenu = UIEditMenuInteraction(delegate: self)
+    /// Set while a header menu is being raised, so the one interaction can serve both menus.
+    private var pendingHeaderMenu: (axis: GridHeaderView.Axis, index: Int)?
 
     /// How far past the edge of the selection the fill handle can still be grabbed. The handle is
     /// drawn small — a fingertip is not.
@@ -195,10 +272,27 @@ final class GridHostView: UIView {
         scrollView.addSubview(canvasView)
         addSubview(scrollView)
 
+        // Added before the headers so a frozen pane can never draw over the row numbers.
+        for pane in [frozenColumnBand, frozenRowBand, frozenCorner] {
+            // The panes are pictures, not controls: every touch belongs to the scroll view
+            // underneath, and the gestures translate the coordinates instead. A pane that swallowed
+            // touches would make the frozen cells unselectable.
+            pane.isUserInteractionEnabled = false
+            pane.isHidden = true
+            addSubview(pane)
+        }
+        for divider in [frozenRowDivider, frozenColumnDivider] {
+            divider.backgroundColor = .separator
+            divider.isUserInteractionEnabled = false
+            divider.isHidden = true
+            addSubview(divider)
+        }
+
         addSubview(columnHeader)
         addSubview(rowHeader)
         cornerView.backgroundColor = .secondarySystemBackground
         addSubview(cornerView)
+        installHeaderCallbacks()
 
         addInteraction(editMenu)
         installGestures()
@@ -246,8 +340,11 @@ final class GridHostView: UIView {
     /// Applies a new render state. Cheap to call on every SwiftUI update: the geometry is only
     /// rebuilt when something it depends on actually changed.
     func apply(sheet: SheetData?, metrics: GridMetrics, selection: SheetSelection?,
-               showGridLines: Bool) {
-        let geometryChanged = self.sheet != sheet || baseMetrics != metrics || geometry == nil
+               showGridLines: Bool, frozen: FrozenPanes = FrozenPanes(),
+               hiddenRows: Set<Int> = [], filteredColumns: Set<Int> = []) {
+        let geometryChanged = self.sheet != sheet || baseMetrics != metrics
+            || self.hiddenRows != hiddenRows || geometry == nil
+        let frozenChanged = self.frozen != frozen
         // A selection arriving from outside — undo, a fill, the reference box — may be somewhere
         // the user cannot see, so it is followed. A selection this view just made is already
         // visible, and scrolling to it would fight the finger.
@@ -257,17 +354,63 @@ final class GridHostView: UIView {
         self.baseMetrics = metrics
         self.selection = selection
         self.showGridLines = showGridLines
+        self.frozen = frozen
+        self.hiddenRows = hiddenRows
 
         if geometryChanged {
             rebuildGeometry()
+        } else if frozenChanged {
+            repositionCanvas()
         } else {
             refreshCanvas()
         }
         columnHeader.selection = selection
         rowHeader.selection = selection
+        columnHeader.filteredColumns = filteredColumns
+        // A resize is an edit, so it needs both: the right to write, and the epic switched on.
+        columnHeader.isEditable = isEditable && allowsStructure
+        rowHeader.isEditable = isEditable && allowsStructure
 
         if arrivedFromOutside, let active = selection?.active {
             scrollTo(active, animated: false)
+        }
+    }
+
+    /// Wires the two headers to this view. Every one of these is a request, not an action — the
+    /// grid does not own the workbook, and a resize is an edit like any other.
+    private func installHeaderCallbacks() {
+        columnHeader.onSelect = { [weak self] in self?.selectColumns($0...$0) }
+        columnHeader.onExtend = { [weak self] index in
+            guard let self, let anchor = self.selection?.anchor else { return }
+            self.selectColumns(min(anchor.column, index)...max(anchor.column, index),
+                               keepingAnchorAt: anchor.column)
+        }
+        columnHeader.onMenu = { [weak self] index, point in
+            self?.presentHeaderMenu(axis: .columns, index: index,
+                                    at: self?.columnHeader.convert(point, to: self) ?? point)
+        }
+        columnHeader.onResizePreview = { [weak self] index, size in
+            self?.previewResize(axis: .columns, index: index, size: size)
+        }
+        columnHeader.onResizeCommit = { [weak self] index, size in
+            self?.commitResize(axis: .columns, index: index, size: size)
+        }
+
+        rowHeader.onSelect = { [weak self] in self?.selectRows($0...$0) }
+        rowHeader.onExtend = { [weak self] index in
+            guard let self, let anchor = self.selection?.anchor else { return }
+            self.selectRows(min(anchor.row, index)...max(anchor.row, index),
+                            keepingAnchorAt: anchor.row)
+        }
+        rowHeader.onMenu = { [weak self] index, point in
+            self?.presentHeaderMenu(axis: .rows, index: index,
+                                    at: self?.rowHeader.convert(point, to: self) ?? point)
+        }
+        rowHeader.onResizePreview = { [weak self] index, size in
+            self?.previewResize(axis: .rows, index: index, size: size)
+        }
+        rowHeader.onResizeCommit = { [weak self] index, size in
+            self?.commitResize(axis: .rows, index: index, size: size)
         }
     }
 
@@ -289,14 +432,39 @@ final class GridHostView: UIView {
                                   height: bounds.height - headerHeight)
         columnHeader.labelFontSize = 11 * CGFloat(baseMetrics.zoom)
         rowHeader.labelFontSize = 11 * CGFloat(baseMetrics.zoom)
-        canvasView.baseFontSize = 13 * CGFloat(baseMetrics.zoom)
+        for canvas in [canvasView, frozenCorner, frozenRowBand, frozenColumnBand] {
+            canvas.baseFontSize = 13 * CGFloat(baseMetrics.zoom)
+        }
         repositionCanvas()
     }
 
     // MARK: - Geometry
 
+    /// The sheet as it should be laid out right now: the workbook's own sizes, with a resize drag's
+    /// live size standing in for the stored one.
+    private var effectiveSheet: SheetData? {
+        guard let resizePreview, var sheet else { return sheet }
+        // The preview is in on-screen points and the stored sizes are unzoomed, so it is divided
+        // back out — otherwise a resize made while zoomed in would commit a much wider column than
+        // the one the user dragged.
+        let stored = resizePreview.size / max(baseMetrics.zoom, 0.01)
+        let key = String(resizePreview.index - 1)
+        switch resizePreview.axis {
+        case .columns:
+            var widths = sheet.colWidths ?? [:]
+            widths[key] = stored
+            sheet.colWidths = widths
+        case .rows:
+            var heights = sheet.rowHeights ?? [:]
+            heights[key] = stored
+            sheet.rowHeights = heights
+        }
+        return sheet
+    }
+
     private func rebuildGeometry() {
-        let geometry = GridGeometry(sheet: sheet, metrics: baseMetrics)
+        let geometry = GridGeometry(sheet: effectiveSheet, metrics: baseMetrics,
+                                    hiddenRows: hiddenRows)
         self.geometry = geometry
         // The spacer is the only thing that establishes `contentSize`; a trailing margin keeps the
         // last column and row from sitting flush against the screen edge.
@@ -309,24 +477,64 @@ final class GridHostView: UIView {
         repositionCanvas()
     }
 
+    /// Where the frozen panes go and how a touch maps through them. See ``FrozenPaneLayout``.
+    private var paneLayout: FrozenPaneLayout {
+        FrozenPaneLayout(frozen: frozen, geometry: geometry, viewport: scrollView.bounds.size,
+                         contentOffset: scrollView.contentOffset)
+    }
+
     /// Moves the canvas over the visible rectangle and hands it the matching content origin.
+    ///
+    /// With panes frozen the viewport is in four parts, and each is the same renderer pointed at a
+    /// different content origin: the corner shows the top-left of the sheet and never moves, the
+    /// two bands each follow one axis, and the main canvas sits below and right of them showing
+    /// content offset by the frozen extent. The panes are drawn *over* the scroll view, so the
+    /// content passes underneath them — see the touch translation in ``contentPoint(fromViewPoint:)``.
     private func repositionCanvas() {
         guard geometry != nil else { return }
-        let offset = scrollView.contentOffset
-        let visible = CGRect(origin: offset, size: scrollView.bounds.size)
-        canvasView.frame = visible
-        canvasView.contentOrigin = offset
-        columnHeader.contentOffset = offset.x
-        rowHeader.contentOffset = offset.y
+        let layout = paneLayout
+        let origin = scrollView.frame.origin
+
+        canvasView.frame = layout.mainFrame
+        canvasView.contentOrigin = layout.mainContentOrigin
+
+        // The panes are laid out in viewport coordinates and live in this view's, so each frame is
+        // shifted past the two headers.
+        for (pane, part, visible) in [
+            (frozenCorner, layout.corner, layout.hasFrozenRows && layout.hasFrozenColumns),
+            (frozenRowBand, layout.rowBand, layout.hasFrozenRows),
+            (frozenColumnBand, layout.columnBand, layout.hasFrozenColumns),
+        ] {
+            pane.isHidden = !visible
+            pane.frame = part.frame.offsetBy(dx: origin.x, dy: origin.y)
+            pane.contentOrigin = part.contentOrigin
+        }
+
+        let hairline = 1 / (window?.screen.scale ?? 2)
+        frozenRowDivider.isHidden = !layout.hasFrozenRows
+        frozenRowDivider.frame = CGRect(x: 0, y: origin.y + layout.frozenSize.height,
+                                        width: bounds.width, height: hairline)
+        frozenColumnDivider.isHidden = !layout.hasFrozenColumns
+        frozenColumnDivider.frame = CGRect(x: origin.x + layout.frozenSize.width, y: 0,
+                                           width: hairline, height: bounds.height)
+
+        columnHeader.contentOffset = scrollView.contentOffset.x
+        columnHeader.frozen = (frozen.columns, layout.frozenSize.width)
+        rowHeader.contentOffset = scrollView.contentOffset.y
+        rowHeader.frozen = (frozen.rows, layout.frozenSize.height)
         refreshCanvas()
     }
 
     private func refreshCanvas() {
         guard let geometry else { return }
-        canvasView.model = GridRenderModel(sheet: sheet, geometry: geometry,
-                                           selection: selection, showGridLines: showGridLines,
-                                           fillPreview: fillPreview,
-                                           showsFillHandle: isEditable)
+        let model = GridRenderModel(sheet: effectiveSheet, geometry: geometry,
+                                    selection: selection, showGridLines: showGridLines,
+                                    fillPreview: fillPreview,
+                                    showsFillHandle: isEditable)
+        canvasView.model = model
+        for pane in [frozenCorner, frozenRowBand, frozenColumnBand] where !pane.isHidden {
+            pane.model = model
+        }
     }
 
     // MARK: - Hit testing
@@ -347,38 +555,108 @@ final class GridHostView: UIView {
         return address
     }
 
-    /// Converts a point in this view's coordinates into the scroll view's content coordinates.
+    /// Converts a point in this view's coordinates into the scroll view's content coordinates,
+    /// through whatever is frozen. See ``FrozenPaneLayout/contentPoint(fromViewportPoint:)``.
     private func contentPoint(fromViewPoint point: CGPoint) -> CGPoint {
-        CGPoint(x: point.x - scrollView.frame.minX + scrollView.contentOffset.x,
-                y: point.y - scrollView.frame.minY + scrollView.contentOffset.y)
+        paneLayout.contentPoint(fromViewportPoint:
+            CGPoint(x: point.x - scrollView.frame.minX, y: point.y - scrollView.frame.minY))
     }
 
-    /// The fill handle's touch target, in content coordinates.
+    /// The inverse: where a content point currently shows on screen, or nil when nothing is
+    /// showing it.
+    private func viewPoint(fromContentPoint point: CGPoint) -> CGPoint? {
+        paneLayout.viewportPoint(fromContentPoint: point).map {
+            CGPoint(x: $0.x + scrollView.frame.minX, y: $0.y + scrollView.frame.minY)
+        }
+    }
+
+    /// The fill handle's touch target, in this view's coordinates.
     ///
     /// Computed from the same merge-aware rectangle the canvas draws the handle in, so the two
     /// cannot end up in different places on a selection that ends on a merged cell.
     private func fillHandleTouchRect() -> CGRect? {
         guard isEditable, let geometry, let selection else { return nil }
         let frame = geometry.rect(for: selection.range, cells: sheet?.cells)
+        guard let corner = viewPoint(fromContentPoint: CGPoint(x: frame.maxX, y: frame.maxY)) else {
+            return nil
+        }
         let radius = Self.fillHandleTouchRadius
-        return CGRect(x: frame.maxX - radius, y: frame.maxY - radius,
+        return CGRect(x: corner.x - radius, y: corner.y - radius,
                       width: radius * 2, height: radius * 2)
+    }
+
+    // MARK: - Header selection
+
+    /// How far a whole-column or whole-row selection actually reaches.
+    ///
+    /// The web app selects to `MAX_ROWS`, all 65,536 of them. That cannot be copied here: every
+    /// command walks `selection.range.addresses`, so a column selected to the format's maximum
+    /// would ask the formatter to create 65,536 cells from one tap. The laid-out extent is what the
+    /// user can see and scroll to, it already covers everything populated, and it is bounded.
+    private var selectionExtent: (columns: Int, rows: Int) {
+        geometry?.extent ?? (26, 100)
+    }
+
+    private func selectColumns(_ columns: ClosedRange<Int>, keepingAnchorAt anchor: Int? = nil) {
+        takeFirstResponderIfIdle()
+        let rows = selectionExtent.rows
+        let anchorColumn = anchor ?? columns.lowerBound
+        let activeColumn = anchorColumn == columns.lowerBound ? columns.upperBound : columns.lowerBound
+        update(selection: SheetSelection(anchor: CellAddress(column: anchorColumn, row: 1),
+                                         active: CellAddress(column: activeColumn, row: rows)))
+    }
+
+    private func selectRows(_ rows: ClosedRange<Int>, keepingAnchorAt anchor: Int? = nil) {
+        takeFirstResponderIfIdle()
+        let columns = selectionExtent.columns
+        let anchorRow = anchor ?? rows.lowerBound
+        let activeRow = anchorRow == rows.lowerBound ? rows.upperBound : rows.lowerBound
+        update(selection: SheetSelection(anchor: CellAddress(column: 1, row: anchorRow),
+                                         active: CellAddress(column: columns, row: activeRow)))
+    }
+
+    // MARK: - Resizing
+
+    private func previewResize(axis: GridHeaderView.Axis, index: Int, size: Double) {
+        resizePreview = (axis, index, size)
+        rebuildGeometry()
+    }
+
+    private func commitResize(axis: GridHeaderView.Axis, index: Int, size: Double) {
+        // The preview is dropped but the geometry is deliberately *not* rebuilt here: the workbook
+        // is about to come back with the new size in it, and rebuilding first would snap the column
+        // to its old width for one frame on the way.
+        resizePreview = nil
+        let stored = size / max(baseMetrics.zoom, 0.01)
+        // A drag on a header inside the selection resizes all of it, which is how a user makes six
+        // columns the same width without doing it six times.
+        switch axis {
+        case .columns:
+            let range = selection?.range.columns.contains(index) == true
+                ? selection!.range.columns : index...index
+            onStructure(.resizeColumns(range, stored))
+        case .rows:
+            let range = selection?.range.rows.contains(index) == true
+                ? selection!.range.rows : index...index
+            onStructure(.resizeRows(range, stored))
+        }
     }
 
     // MARK: - Gestures
 
+    // Both taps resolve through this view's coordinates rather than the scroll view's, because a
+    // touch landing on a frozen pane is not at the offset the scroll view would report.
+
     @objc private func handleTap(_ recognizer: UITapGestureRecognizer) {
-        guard let address = address(atContentPoint: recognizer.location(in: scrollView)) else {
-            return
-        }
+        let point = contentPoint(fromViewPoint: recognizer.location(in: self))
+        guard let address = address(atContentPoint: point) else { return }
         takeFirstResponderIfIdle()
         update(selection: SheetSelection(address))
     }
 
     @objc private func handleDoubleTap(_ recognizer: UITapGestureRecognizer) {
-        guard let address = address(atContentPoint: recognizer.location(in: scrollView)) else {
-            return
-        }
+        let point = contentPoint(fromViewPoint: recognizer.location(in: self))
+        guard let address = address(atContentPoint: point) else { return }
         update(selection: SheetSelection(address))
         onActivate(address)
     }
@@ -603,9 +881,20 @@ final class GridHostView: UIView {
     }
 
     /// Brings `address` into view, used when a selection changes from outside the grid.
+    ///
+    /// The rectangle handed to the scroll view is shifted back by the frozen extent, because the
+    /// scrolling region begins where the frozen panes end: without that, a cell scrolled "into
+    /// view" can land underneath the frozen band and stay invisible.
     func scrollTo(_ address: CellAddress, animated: Bool) {
         guard let geometry, scrollView.bounds.width > 0 else { return }
-        let rect = geometry.rect(for: address).insetBy(dx: -8, dy: -8)
+        let frozenSize = paneLayout.frozenSize
+        let cell = geometry.rect(for: address)
+        // Already showing in a frozen pane: it cannot be scrolled to, and does not need to be.
+        if cell.maxX <= frozenSize.width || cell.maxY <= frozenSize.height {
+            return
+        }
+        let rect = cell.offsetBy(dx: -frozenSize.width, dy: -frozenSize.height)
+            .insetBy(dx: -8, dy: -8)
         guard !scrollView.bounds.contains(rect) else { return }
         scrollView.scrollRectToVisible(rect, animated: animated)
     }
@@ -727,8 +1016,116 @@ final class GridHostView: UIView {
 
     private func presentEditMenu(at viewPoint: CGPoint) {
         takeFirstResponderIfIdle()
+        pendingHeaderMenu = nil
         editMenu.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil,
                                                                sourcePoint: viewPoint))
+    }
+
+    // MARK: - Header menu
+
+    /// Epic 10 — which header the menu being shown belongs to, or nil when it is the cell menu.
+    ///
+    /// One interaction serves both because they are the same affordance in two places, and because
+    /// two `UIEditMenuInteraction`s on one view would race to present.
+    private func presentHeaderMenu(axis: GridHeaderView.Axis, index: Int, at viewPoint: CGPoint) {
+        guard allowsStructure else { return }
+        takeFirstResponderIfIdle()
+        pendingHeaderMenu = (axis, index)
+        editMenu.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil,
+                                                               sourcePoint: viewPoint))
+    }
+
+    /// The menu a press on a row or column header raises.
+    ///
+    /// Ordered the way the web app's `HeaderContextMenu` orders it — sort, filter, insert, delete,
+    /// hide — because the two apps are used by the same people and muscle memory is worth more than
+    /// a tidier grouping. Freeze is appended: the web app has no equivalent, and a header is where
+    /// a phone user goes looking for it.
+    private func headerMenu(axis: GridHeaderView.Axis, index: Int) -> UIMenu {
+        let count = axis == .columns
+            ? (selection?.range.columns.contains(index) == true ? selection!.range.columnCount : 1)
+            : (selection?.range.rows.contains(index) == true ? selection!.range.rowCount : 1)
+        let noun = axis == .columns
+            ? (count > 1 ? "\(count) Columns" : "Column")
+            : (count > 1 ? "\(count) Rows" : "Row")
+
+        var sections: [UIMenuElement] = []
+
+        if axis == .columns {
+            sections.append(UIMenu(title: "", options: .displayInline, children: [
+                action("Sort A → Z", "arrow.down") { [weak self] in
+                    self?.onStructure(.sort(column: index, ascending: true))
+                },
+                action("Sort Z → A", "arrow.up") { [weak self] in
+                    self?.onStructure(.sort(column: index, ascending: false))
+                },
+            ]))
+
+            var filtering = [action("Filter\u{2026}", "line.3.horizontal.decrease") { [weak self] in
+                self?.onStructure(.filter(column: index))
+            }]
+            if columnHeader.filteredColumns.contains(index) {
+                filtering.append(action("Clear Filter", "xmark") { [weak self] in
+                    self?.onStructure(.clearFilter(column: index))
+                })
+            }
+            sections.append(UIMenu(title: "", options: .displayInline, children: filtering))
+        }
+
+        guard isEditable else { return UIMenu(children: sections) }
+
+        let isColumns = axis == .columns
+        sections.append(UIMenu(title: "", options: .displayInline, children: [
+            action(isColumns ? "Insert \(noun) Left" : "Insert \(noun) Above",
+                   isColumns ? "arrow.left" : "arrow.up") { [weak self] in
+                self?.onStructure(isColumns ? .insertColumns(before: true) : .insertRows(before: true))
+            },
+            action(isColumns ? "Insert \(noun) Right" : "Insert \(noun) Below",
+                   isColumns ? "arrow.right" : "arrow.down") { [weak self] in
+                self?.onStructure(isColumns ? .insertColumns(before: false) : .insertRows(before: false))
+            },
+        ]))
+
+        var removal = [
+            UIAction(title: "Delete \(noun)", image: UIImage(systemName: "trash"),
+                     attributes: .destructive) { [weak self] _ in
+                self?.onStructure(isColumns ? .deleteColumns : .deleteRows)
+            },
+            action("Hide \(noun)", "eye.slash") { [weak self] in
+                self?.onStructure(isColumns ? .hideColumns : .hideRows)
+            },
+        ]
+        if selectionHidesAnything {
+            removal.append(action("Show Hidden", "eye") { [weak self] in
+                self?.onStructure(.show)
+            })
+        }
+        sections.append(UIMenu(title: "", options: .displayInline, children: removal))
+
+        sections.append(UIMenu(title: "", options: .displayInline, children: [
+            frozen.isEmpty
+                ? action("Freeze Up To Here", "lock") { [weak self] in
+                    self?.onStructure(.freezeToSelection)
+                }
+                : action("Unfreeze Panes", "lock.open") { [weak self] in
+                    self?.onStructure(.unfreeze)
+                },
+        ]))
+
+        return UIMenu(children: sections)
+    }
+
+    /// True when the selection covers a row or column stored at zero size, so the menu can offer to
+    /// put it back. A hidden header has no edge left to grab, so the menu is the only way out.
+    private var selectionHidesAnything: Bool {
+        guard let range = selection?.range, let sheet else { return false }
+        return range.rows.contains { sheet.height(ofRow: $0 - 1) == 0 }
+            || range.columns.contains { sheet.width(ofColumn: $0 - 1) == 0 }
+    }
+
+    private func action(_ title: String, _ symbol: String,
+                        handler: @escaping () -> Void) -> UIAction {
+        UIAction(title: title, image: UIImage(systemName: symbol)) { _ in handler() }
     }
 }
 
@@ -742,6 +1139,10 @@ extension GridHostView: UIEditMenuInteractionDelegate {
     func editMenuInteraction(_ interaction: UIEditMenuInteraction,
                              menuFor configuration: UIEditMenuConfiguration,
                              suggestedActions: [UIMenuElement]) -> UIMenu? {
+        if let pendingHeaderMenu {
+            return headerMenu(axis: pendingHeaderMenu.axis, index: pendingHeaderMenu.index)
+        }
+
         var actions: [UIMenuElement] = []
         if isEditable {
             actions.append(UIAction(title: "Cut", image: UIImage(systemName: "scissors")) {
@@ -777,7 +1178,7 @@ extension GridHostView: UIGestureRecognizerDelegate {
                            shouldReceive touch: UITouch) -> Bool {
         guard gestureRecognizer === fillPanGesture else { return true }
         guard let rect = fillHandleTouchRect() else { return false }
-        return rect.contains(touch.location(in: scrollView))
+        return rect.contains(touch.location(in: self))
     }
 }
 

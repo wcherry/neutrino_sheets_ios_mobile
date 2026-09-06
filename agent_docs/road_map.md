@@ -289,7 +289,7 @@ does. This is what makes an early, genuinely useful release possible.
 * ✅ Cell styling: fonts, colours, fills, alignment, borders, wrap
 * ✅ Number formats: number, currency, percent, date, time, datetime, decimals, custom
 * ✅ Merged cells, column widths, row heights
-* ✅ Tab bar for multi-sheet workbooks (read-only; authoring tabs is Epic 10)
+* ✅ Tab bar for multi-sheet workbooks (read-only here; authoring tabs is Epic 10, now in)
 * ⚠️ Pinch zoom and momentum scroll ship; **60fps on a 10k-cell sheet is not yet measured.** The
   work per frame is bounded by the viewport rather than the workbook — the canvas is
   viewport-sized and repositioned on scroll — but that is an argument, not a benchmark. Profile on
@@ -325,7 +325,7 @@ Milestone: an edit made on the phone appears on the web.
 
 Milestone 1 deliverable: log in, import keys, browse Drive, open any spreadsheet, read it correctly,
 edit a cell's literal value, save. **Delivered** — 134 unit tests at the time, all passing; the
-suite stands at 269 with Epics 8 and 9 in.
+suite stands at 392 with Epics 8, 9 and 10 in.
 
 Two limits worth stating plainly:
 
@@ -422,18 +422,64 @@ Two things this epic changed outside itself, both deliberate:
 
 ⸻
 
-⬜ Epic 10 — Structure
+✅ Epic 10 — Structure
 
-* ⬜ Insert / delete rows and columns, with reference shifting matching `structuralShift.ts`
-* ⬜ Resize columns and rows by drag
-* ⬜ Hide / show
-* ⬜ Freeze panes
-* ⬜ Add / rename / colour / reorder / duplicate / delete sheet tabs
-* ⬜ Sort a range or a column
-* ⬜ Per-column filters
-* ⬜ Find & replace
+Where Epics 8 and 9 patch cells, this epic rearranges them — and that is a different kind of edit,
+so it takes a different route. A row insert moves *every cell below it*, and a tab reorder is not a
+change to cells at all, so `WorkbookEdit` now carries either a set of per-cell patches or a snapshot
+of the tab list. Both undo through one history; a snapshot is cheap because `SheetData` is a value
+type and the tabs an edit did not touch share storage.
 
-Milestone: a spreadsheet can be built from scratch on a phone.
+* ✅ Insert / delete rows and columns, with reference shifting matching `structuralShift.ts` —
+  ported pass for pass, including the rule that only grows or shrinks a merge when the edit lands
+  *strictly inside* its span. **Conditional-format ranges are shifted too**, by rewriting the one
+  key that means something inside the preserved JSON: this app carries `conditionalFormats`
+  opaquely (Epic 16 renders them), but a rule still saying `A2:A9` after a row went in above it
+  colours the wrong cells, and the user would only ever see it on the web. Charts are deliberately
+  left alone — `computeStructuralShift` does not move them either, and inventing a rule here would
+  put the two clients in disagreement
+* ✅ Resize columns and rows by drag, from the header's edge. The drag re-lays-out a *preview*
+  sheet and writes nothing until the finger lifts — every intermediate width would otherwise be an
+  undo entry and a save. Dragging a header inside the selection resizes all of it
+* ✅ Hide / show — stored as a size of zero, which is what the web app writes, so a column hidden
+  here is hidden there. "Show Hidden" appears in the header menu whenever the selection spans
+  something hidden, and "Show All" is the way out for a user who cannot find the gap
+* ✅ Freeze panes — four regions, one renderer, three extra content origins. Held **in memory, per
+  tab**: the file format has no field for it and the web app has no freeze, so there is nothing to
+  agree with; a key invented here would be one the browser ignores today and a later release might
+  claim for something else. The mapping lives in `FrozenPaneLayout` rather than inside a `UIView`,
+  because every way of getting it wrong is visual and none of them are readable in a diff
+* ✅ Add / rename / colour / reorder / duplicate / delete sheet tabs, from a long press on the tab
+  itself — a tab command is *about* one tab, and pressing it is the shortest way to say which.
+  Two divergences from `useSheets`, both deliberate: a new tab takes the first unused `Sheet N`
+  rather than `Sheet ${count + 1}`, which repeats a name as soon as one has been deleted and would
+  give Epic 15 two tabs to address by one name; and a copy lands directly after its source rather
+  than at the end, because the tab bar scrolls and a copy off the right-hand edge is one the user
+  has to go looking for
+* ✅ Sort a range or a column. A block spanning more than one row and column sorts within itself;
+  anything else sorts the tab's whole used range by the chosen column, so rows stay together —
+  sorting one column in isolation is not a sort of anything. **A range containing a merge is
+  refused**, with a reason: moving an anchor away from the cells it covers leaves `mergeAnchor`
+  pointers aimed at cells that no longer exist, and no undo the user reaches for obviously fixes it
+* ✅ Per-column filters — the web app's value list, blanks included. Filtered rows lay out at zero
+  height, indistinguishable from a hidden one to everything downstream. Never written to the file:
+  the web app keeps filters in React state and there is no field for them
+* ✅ Find & replace, searching what was **typed** rather than what is displayed, so a formula
+  matches as text and a currency cell matches the number behind it. Matches come back in true
+  reading order rather than the browser's id-as-text ordering, which puts `AA1` before `B1`
+
+One rule carried over from Epic 8, because it is the same hazard: **a replaced formula loses its
+stored result.** Rewriting `=SUM(B1:B9)` into `=SUM(C1:C9)` while keeping the old total would put a
+number in a shared file that no longer follows from the formula beside it. The cell shows its own
+formula text here and recomputes when the workbook is next opened on the web.
+
+A note on whole-column selection: tapping a column header selects to the grid's laid-out extent,
+not to the format's 65,536-row maximum the way the web app does. Every command walks
+`selection.range.addresses`, so a column selected to the maximum would ask the formatter to create
+65,536 cells from one tap.
+
+Milestone: a spreadsheet can be built from scratch on a phone. **Delivered** — 392 unit tests, all
+passing.
 
 ⸻
 

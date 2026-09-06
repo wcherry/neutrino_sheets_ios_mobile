@@ -1,4 +1,5 @@
 import XCTest
+import NeutrinoCore
 @testable import NeutrinoSheets
 
 /// The small models — the ones whose mistakes show up as a wrong icon, a stray extension, or an

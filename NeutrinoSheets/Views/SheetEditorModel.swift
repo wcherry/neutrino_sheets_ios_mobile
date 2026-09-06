@@ -434,22 +434,400 @@ final class SheetEditorModel: ObservableObject {
         return SheetClipboard.fromTabSeparated(text)
     }
 
+    // MARK: - Structure
+
+    /// The rows and columns one structural command covers: the selection, or the active cell when
+    /// there is no block selected.
+    private var structuralTarget: CellRange? {
+        selection?.range
+    }
+
+    /// Epic 10 — "Insert / delete rows and columns".
+    ///
+    /// As many rows go in as the selection covers, which is how every spreadsheet reads a selection
+    /// of three rows and an "Insert above": three rows, not one. The cells, the row heights, the
+    /// table regions and the conditional-format ranges all move together — see ``StructuralShift``.
+    func insertRows(before: Bool) {
+        guard let range = structuralTarget else { return }
+        let index = before ? range.start.row : range.end.row + 1
+        // Repeating the same index inserts the whole block in one place, rather than scattering the
+        // new rows one apart from each other.
+        shift(axis: .row, operation: .insert,
+              indices: Array(repeating: index, count: range.rowCount),
+              name: range.rowCount > 1 ? "Insert Rows" : "Insert Row",
+              selectionAfter: SheetSelection(anchor: CellAddress(column: range.start.column, row: index),
+                                             active: CellAddress(column: range.end.column,
+                                                                 row: index + range.rowCount - 1)))
+    }
+
+    func insertColumns(before: Bool) {
+        guard let range = structuralTarget else { return }
+        let index = before ? range.start.column : range.end.column + 1
+        shift(axis: .column, operation: .insert,
+              indices: Array(repeating: index, count: range.columnCount),
+              name: range.columnCount > 1 ? "Insert Columns" : "Insert Column",
+              selectionAfter: SheetSelection(anchor: CellAddress(column: index, row: range.start.row),
+                                             active: CellAddress(column: index + range.columnCount - 1,
+                                                                 row: range.end.row)))
+    }
+
+    func deleteRows() {
+        guard let range = structuralTarget else { return }
+        // Descending, so removing one row never renumbers the ones still to go.
+        shift(axis: .row, operation: .delete, indices: range.rows.reversed(),
+              name: range.rowCount > 1 ? "Delete Rows" : "Delete Row",
+              selectionAfter: SheetSelection(CellAddress(column: range.start.column,
+                                                         row: range.start.row)))
+    }
+
+    func deleteColumns() {
+        guard let range = structuralTarget else { return }
+        shift(axis: .column, operation: .delete, indices: range.columns.reversed(),
+              name: range.columnCount > 1 ? "Delete Columns" : "Delete Column",
+              selectionAfter: SheetSelection(CellAddress(column: range.start.column,
+                                                         row: range.start.row)))
+    }
+
+    private func shift(axis: StructuralAxis, operation: StructuralOperation, indices: [Int],
+                       name: String, selectionAfter: SheetSelection?) {
+        guard !indices.isEmpty else { return }
+        editActiveSheet(name: name, selectionAfter: selectionAfter) { sheet in
+            StructuralShift.apply(to: sheet, axis: axis, operation: operation, indices: indices)
+        }
+    }
+
+    // MARK: - Sizes
+
+    /// Epic 10 — "Resize columns and rows by drag", and the hide/show pair, which are the same
+    /// write: a hidden column is one stored at zero width, which is what the web app does and what
+    /// makes a column hidden here hidden there too.
+    ///
+    /// - Parameter width: nil removes the override, putting the column back to the default width.
+    func resize(columns: ClosedRange<Int>, to width: Double?, name: String = "Resize Column") {
+        editActiveSheet(name: name) { sheet in
+            var updated = sheet
+            var widths = sheet.colWidths ?? [:]
+            for column in columns {
+                let key = String(column - 1)
+                if let width { widths[key] = max(0, width) } else { widths.removeValue(forKey: key) }
+            }
+            updated.colWidths = widths.isEmpty ? nil : widths
+            return updated
+        }
+    }
+
+    func resize(rows: ClosedRange<Int>, to height: Double?, name: String = "Resize Row") {
+        editActiveSheet(name: name) { sheet in
+            var updated = sheet
+            var heights = sheet.rowHeights ?? [:]
+            for row in rows {
+                let key = String(row - 1)
+                if let height { heights[key] = max(0, height) } else { heights.removeValue(forKey: key) }
+            }
+            updated.rowHeights = heights.isEmpty ? nil : heights
+            return updated
+        }
+    }
+
+    /// Epic 10 — "Hide / show".
+    func hideRows() {
+        guard let range = structuralTarget else { return }
+        resize(rows: range.rows, to: 0, name: range.rowCount > 1 ? "Hide Rows" : "Hide Row")
+    }
+
+    func hideColumns() {
+        guard let range = structuralTarget else { return }
+        resize(columns: range.columns, to: 0,
+               name: range.columnCount > 1 ? "Hide Columns" : "Hide Column")
+    }
+
+    /// Whether anything inside the selection is hidden, so the menu can offer to show it.
+    var selectionHasHiddenRowsOrColumns: Bool {
+        guard let range = structuralTarget, let sheet = activeSheet else { return false }
+        return range.rows.contains { sheet.height(ofRow: $0 - 1) == 0 }
+            || range.columns.contains { sheet.width(ofColumn: $0 - 1) == 0 }
+    }
+
+    /// Puts back anything hidden inside the selection.
+    ///
+    /// Reachable because a hidden row still has an index: dragging a selection across the gap
+    /// covers it, even though it draws nothing. ``showEverything()`` is the way out for a user who
+    /// cannot find the gap.
+    func showSelection() {
+        guard let range = structuralTarget, let sheet = activeSheet else { return }
+        let rows = range.rows.filter { sheet.height(ofRow: $0 - 1) == 0 }
+        let columns = range.columns.filter { sheet.width(ofColumn: $0 - 1) == 0 }
+        guard !rows.isEmpty || !columns.isEmpty else { return }
+
+        editActiveSheet(name: "Show") { sheet in
+            var updated = sheet
+            var heights = sheet.rowHeights ?? [:]
+            for row in rows { heights.removeValue(forKey: String(row - 1)) }
+            var widths = sheet.colWidths ?? [:]
+            for column in columns { widths.removeValue(forKey: String(column - 1)) }
+            updated.rowHeights = heights.isEmpty ? nil : heights
+            updated.colWidths = widths.isEmpty ? nil : widths
+            return updated
+        }
+    }
+
+    /// Whether the active tab hides anything at all.
+    var hasHiddenRowsOrColumns: Bool {
+        guard let sheet = activeSheet else { return false }
+        return (sheet.rowHeights ?? [:]).values.contains(0) || (sheet.colWidths ?? [:]).values.contains(0)
+    }
+
+    /// Restores every hidden row and column on the active tab.
+    func showEverything() {
+        editActiveSheet(name: "Show All") { sheet in
+            var updated = sheet
+            let heights = (sheet.rowHeights ?? [:]).filter { $0.value != 0 }
+            let widths = (sheet.colWidths ?? [:]).filter { $0.value != 0 }
+            updated.rowHeights = heights.isEmpty ? nil : heights
+            updated.colWidths = widths.isEmpty ? nil : widths
+            return updated
+        }
+    }
+
+    // MARK: - Sorting
+
+    /// Epic 10 — "Sort a range or a column".
+    ///
+    /// What gets sorted depends on the selection, the way it does in Excel:
+    ///
+    /// - a block spanning more than one column and more than one row sorts **within itself**;
+    /// - anything else — a single cell, or a whole column picked from its header — sorts the tab's
+    ///   entire used range by that column, so the rows stay together. Sorting one column in
+    ///   isolation would shuffle it out of step with the data beside it, which is not a sort of
+    ///   anything, it is a shredder.
+    func sort(by column: Int, ascending: Bool) {
+        guard isEditable, let sheet = activeSheet, let selection else { return }
+
+        let range: CellRange
+        if selection.range.columnCount > 1 && selection.range.rowCount > 1 {
+            range = selection.range
+        } else {
+            guard let used = sheet.usedBounds else { return }
+            range = CellRange(CellAddress(column: 1, row: 1),
+                              CellAddress(column: max(used.columns, column), row: used.rows))
+        }
+
+        switch SortEngine.sortRows(in: range, by: column, ascending: ascending, cells: sheet.cells) {
+        case .success(let changes):
+            guard !changes.isEmpty else { return }
+            apply(changes, name: "Sort")
+        case .failure(.containsMergedCells):
+            show(notice: "Cannot sort a range that contains merged cells")
+        case .failure(.nothingToSort):
+            break
+        }
+    }
+
+    // MARK: - Filtering
+
+    /// Epic 10 — "Per-column filters". Not written to the file; see ``ColumnFilters``.
+    @Published var columnFilters = ColumnFilters()
+
+    /// How far down the tab holds anything — the bound on every whole-column walk.
+    var usedRowCount: Int { activeSheet?.usedBounds?.rows ?? 0 }
+
+    /// The rows the active filters hide, which the grid lays out at zero height.
+    var filteredRows: Set<Int> {
+        guard let sheet = activeSheet else { return [] }
+        return columnFilters.hiddenRows(in: sheet.cells, rows: usedRowCount)
+    }
+
+    /// The distinct entries in a column, for the filter list.
+    func filterValues(inColumn column: Int) -> [String] {
+        guard let sheet = activeSheet else { return [] }
+        return ColumnFilters.values(inColumn: column, cells: sheet.cells, rows: usedRowCount)
+    }
+
+    func setFilter(_ values: Set<String>?, forColumn column: Int) {
+        columnFilters.set(values, forColumn: column)
+    }
+
+    func clearAllFilters() {
+        columnFilters.removeAll()
+    }
+
+    // MARK: - Find & replace
+
+    /// Epic 10 — "Find & replace". The dialog owns the query; the workbook is read here.
+    func matches(for query: String, options: FindReplace.Options) -> [CellAddress] {
+        guard let sheet = activeSheet else { return [] }
+        return FindReplace.matches(in: sheet.cells, query: query, options: options)
+    }
+
+    /// Replaces the first occurrence in one cell.
+    func replace(at address: CellAddress, query: String, with replacement: String,
+                 options: FindReplace.Options) {
+        guard isEditable, let sheet = activeSheet, let cell = sheet.cells[address.id] else { return }
+        var changes = CellChanges()
+        changes.updateValue(FindReplace.replaced(cell, query: query, with: replacement,
+                                                 options: options, all: false),
+                            forKey: address.id)
+        apply(changes, name: "Replace", selectionAfter: SheetSelection(address))
+        noteFormulaRewrite(in: [cell])
+    }
+
+    /// Replaces every occurrence everywhere on the active tab, as one edit.
+    ///
+    /// - Returns: how many cells changed, for the confirmation the dialog shows.
+    @discardableResult
+    func replaceAll(query: String, with replacement: String,
+                    options: FindReplace.Options) -> Int {
+        guard isEditable, let sheet = activeSheet else { return 0 }
+        let addresses = FindReplace.matches(in: sheet.cells, query: query, options: options)
+        guard !addresses.isEmpty else { return 0 }
+
+        var changes = CellChanges()
+        var touched: [SavedCell] = []
+        for address in addresses {
+            guard let cell = sheet.cells[address.id] else { continue }
+            touched.append(cell)
+            changes.updateValue(FindReplace.replaced(cell, query: query, with: replacement,
+                                                     options: options, all: true),
+                                forKey: address.id)
+        }
+        apply(changes, name: "Replace All")
+        noteFormulaRewrite(in: touched)
+        return changes.count
+    }
+
+    /// Says so when a replacement rewrote a formula, because its stored result was dropped with it —
+    /// the same rule, and the same wording, as a pasted formula in Epic 8.
+    private func noteFormulaRewrite(in cells: [SavedCell]) {
+        guard cells.contains(where: { FormulaReferences.isFormula($0.raw ?? "") }) else { return }
+        show(notice: "Replaced formulas recalculate when the sheet is opened on the web")
+    }
+
+    // MARK: - Freeze panes
+
+    /// Epic 10 — "Freeze panes", per tab.
+    ///
+    /// Held in memory rather than written to the workbook, and that is the whole decision: the
+    /// format has no field for it. The web app has no freeze either, so there is nothing to agree
+    /// with — inventing a key would put something in a shared file that the browser ignores today
+    /// and a later web release might claim for something else.
+    private var frozenByTab: [Int: FrozenPanes] = [:]
+
+    var frozen: FrozenPanes {
+        frozenByTab[activeSheetIndex] ?? FrozenPanes()
+    }
+
+    /// Freezes everything above and left of the selection's active cell.
+    func freezeToSelection() {
+        guard let active = selection?.active else { return }
+        let panes = FrozenPanes(rows: active.row - 1, columns: active.column - 1)
+        frozenByTab[activeSheetIndex] = panes.isEmpty ? nil : panes
+        objectWillChange.send()
+        show(notice: panes.isEmpty ? "Panes unfrozen" : "Frozen \(panes.description)")
+    }
+
+    func unfreeze() {
+        guard frozenByTab[activeSheetIndex] != nil else { return }
+        frozenByTab.removeValue(forKey: activeSheetIndex)
+        objectWillChange.send()
+    }
+
+    // MARK: - Tabs
+
+    /// Epic 10 — "Add / rename / colour / reorder / duplicate / delete sheet tabs".
+    ///
+    /// Every one of these is a change to the tab list, so they all travel as a ``WorkbookEdit``
+    /// snapshot and all undo in one step.
+    func addSheet() {
+        guard let file else { return }
+        let outcome = SheetTabs.add(to: file.sheets)
+        applyWorkbook(outcome.sheets, name: "Add Sheet", activeIndexAfter: outcome.activeIndex,
+                      selectionAfter: SheetSelection(CellAddress(column: 1, row: 1)))
+    }
+
+    func renameSheet(at index: Int, to name: String) {
+        guard let file else { return }
+        applyWorkbook(SheetTabs.rename(file.sheets, at: index, to: name), name: "Rename Sheet")
+    }
+
+    func setSheetColor(_ color: String?, at index: Int) {
+        guard let file else { return }
+        applyWorkbook(SheetTabs.setColor(file.sheets, at: index, to: color), name: "Sheet Colour")
+    }
+
+    func duplicateSheet(at index: Int) {
+        guard let file else { return }
+        let outcome = SheetTabs.duplicate(file.sheets, at: index)
+        forgetFrozenPanes()
+        applyWorkbook(outcome.sheets, name: "Duplicate Sheet", activeIndexAfter: outcome.activeIndex,
+                      selectionAfter: SheetSelection(CellAddress(column: 1, row: 1)))
+    }
+
+    /// Whether deleting is offered at all — a workbook has to keep one tab.
+    var canDeleteSheet: Bool { (file?.sheets.count ?? 0) > 1 }
+
+    func deleteSheet(at index: Int) {
+        guard let file,
+              let outcome = SheetTabs.delete(file.sheets, at: index, activeIndex: activeSheetIndex)
+        else { return }
+        forgetFrozenPanes()
+        applyWorkbook(outcome.sheets, name: "Delete Sheet", activeIndexAfter: outcome.activeIndex,
+                      selectionAfter: SheetSelection(CellAddress(column: 1, row: 1)))
+    }
+
+    func moveSheet(at index: Int, by offset: Int) {
+        guard let file,
+              let outcome = SheetTabs.move(file.sheets, from: index, by: offset,
+                                           activeIndex: activeSheetIndex) else { return }
+        forgetFrozenPanes()
+        applyWorkbook(outcome.sheets, name: "Move Sheet", activeIndexAfter: outcome.activeIndex)
+    }
+
+    /// Drops the frozen panes when the tab list is rearranged.
+    ///
+    /// They are keyed by tab index, and a reorder or a delete renumbers those indices — carrying
+    /// them across would freeze the wrong tab. Re-freezing is two taps, and freezing a tab the user
+    /// never asked to freeze is a grid that will not scroll for reasons nobody can see.
+    private func forgetFrozenPanes() {
+        guard !frozenByTab.isEmpty else { return }
+        frozenByTab.removeAll()
+        objectWillChange.send()
+    }
+
+    /// Moves to another tab, resetting the selection to its top-left cell.
+    func selectSheet(at index: Int) {
+        guard file?.sheets.indices.contains(index) == true, index != activeSheetIndex else { return }
+        activeSheetIndex = index
+        selection = SheetSelection(CellAddress(column: 1, row: 1))
+        // Filters name columns of the tab they were made on; carrying them to another tab would
+        // hide rows for reasons the user could not see there.
+        columnFilters.removeAll()
+    }
+
     // MARK: - Undo / redo
 
     func undo() {
         guard let edit = history.undo() else { return }
-        write(edit.before, tables: edit.tablesBefore)
-        activeSheetIndex = edit.sheetBefore
-        selection = edit.selectionBefore
-        historyToken &+= 1
-        hasUnsavedChanges = true
+        restore(edit, undoing: true)
     }
 
     func redo() {
         guard let edit = history.redo() else { return }
-        write(edit.after, tables: edit.tablesAfter)
-        activeSheetIndex = edit.sheetAfter
-        selection = edit.selectionAfter
+        restore(edit, undoing: false)
+    }
+
+    /// Puts one side of an edit back, whichever shape it was recorded in.
+    private func restore(_ edit: WorkbookEdit, undoing: Bool) {
+        switch edit.change {
+        case .cells(let before, let after, let tablesBefore, let tablesAfter):
+            write(undoing ? before : after, tables: undoing ? tablesBefore : tablesAfter)
+        case .workbook(let before, let after):
+            file?.sheets = undoing ? before : after
+        }
+        // Clamped, because a tab index recorded before a delete can point past the end of the list
+        // the other side of the edit restores.
+        activeSheetIndex = min(max(0, undoing ? edit.sheetBefore : edit.sheetAfter),
+                               max(0, (file?.sheets.count ?? 1) - 1))
+        selection = undoing ? edit.selectionBefore : edit.selectionAfter
         historyToken &+= 1
         hasUnsavedChanges = true
     }
@@ -518,8 +896,9 @@ final class SheetEditorModel: ObservableObject {
         guard !after.isEmpty || !tablesAfter.isEmpty else { return }
         self.file = file
 
-        history.record(WorkbookEdit(before: before, after: after,
-                                    tablesBefore: tablesBefore, tablesAfter: tablesAfter,
+        history.record(WorkbookEdit(change: .cells(before: before, after: after,
+                                                   tablesBefore: tablesBefore,
+                                                   tablesAfter: tablesAfter),
                                     sheetBefore: activeSheetIndex, sheetAfter: activeSheetIndex,
                                     selectionBefore: selection,
                                     selectionAfter: selectionAfter ?? selection,
@@ -527,6 +906,41 @@ final class SheetEditorModel: ObservableObject {
         historyToken &+= 1
         if let selectionAfter { selection = selectionAfter }
         hasUnsavedChanges = true
+    }
+
+    /// Epic 10 — the funnel for an edit that rearranges the workbook rather than patching cells.
+    ///
+    /// A structural edit, a resize and every tab operation come through here. They are recorded as a
+    /// snapshot of the tab list because that is what they are: a row insert moves every cell below
+    /// it, and a tab reorder is not a change to cells at all. See ``WorkbookEdit/Change``.
+    private func applyWorkbook(_ sheets: [SheetData], name: String, activeIndexAfter: Int? = nil,
+                               selectionAfter: SheetSelection? = nil) {
+        guard isEditable, var file, file.sheets != sheets else { return }
+        let before = file.sheets
+        let sheetAfter = min(max(0, activeIndexAfter ?? activeSheetIndex), max(0, sheets.count - 1))
+
+        file.sheets = sheets
+        self.file = file
+
+        history.record(WorkbookEdit(change: .workbook(before: before, after: sheets),
+                                    sheetBefore: activeSheetIndex, sheetAfter: sheetAfter,
+                                    selectionBefore: selection,
+                                    selectionAfter: selectionAfter ?? selection,
+                                    name: name))
+        historyToken &+= 1
+        activeSheetIndex = sheetAfter
+        if let selectionAfter { selection = selectionAfter }
+        hasUnsavedChanges = true
+    }
+
+    /// Runs `transform` over the active tab and records the result. Nil backs out with no edit.
+    private func editActiveSheet(name: String, selectionAfter: SheetSelection? = nil,
+                                 _ transform: (SheetData) -> SheetData?) {
+        guard isEditable, let file, let sheet = activeSheet,
+              let updated = transform(sheet) else { return }
+        var sheets = file.sheets
+        sheets[activeSheetIndex] = updated
+        applyWorkbook(sheets, name: name, selectionAfter: selectionAfter)
     }
 
     /// Writes cells without recording history — the undo and redo path.

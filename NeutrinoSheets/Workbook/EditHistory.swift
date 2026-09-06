@@ -4,36 +4,48 @@ import Foundation
 
 /// One undoable change to a workbook.
 ///
-/// Recorded as the cells that changed rather than as a copy of the whole tab: a snapshot of a
-/// 10,000-cell sheet per keystroke is megabytes of history for a two-character edit, and the phone
-/// is the wrong place to find that out. Both halves are kept — `before` to undo with, `after` to
-/// redo with — so neither direction has to reconstruct anything.
-///
-/// The selection travels with the edit for the same reason a text editor restores the caret:
-/// undoing a paste that landed off-screen is disorienting if the grid does not go back to it.
+/// The selection travels with the edit for the same reason a text editor restores the caret: undoing
+/// a paste that landed off-screen is disorienting if the grid does not go back to it.
 struct WorkbookEdit {
 
-    /// The cells as they were, keyed by tab index. A `nil` cell means it did not exist.
-    ///
-    /// Keyed by tab rather than carrying a single index because one edit really can touch two:
-    /// cutting from one sheet and pasting into another clears the source and writes the
-    /// destination, and undo has to put both back or it puts back neither.
-    let before: [Int: CellChanges]
-    /// The cells as the edit left them.
-    let after: [Int: CellChanges]
+    // MARK: - Change
 
-    /// Epic 9 — a tab's whole ``TableRegion`` list, before and after, for the edits that change it.
+    /// What actually changed, in one of the two shapes an edit can take.
     ///
-    /// Whole lists rather than per-region patches because the list is short — a workbook has a
-    /// handful of tables, not thousands — and because applying a table style *replaces* whatever it
-    /// overlaps, which is a change to the list as a unit. Absent for every edit that touches only
-    /// cells, which is nearly all of them.
-    let tablesBefore: [Int: [TableRegion]]
-    let tablesAfter: [Int: [TableRegion]]
+    /// Two, and not one, because the two kinds of edit have opposite cost profiles. A typed value
+    /// touches one cell out of ten thousand, so recording it as a snapshot of the tab would be
+    /// megabytes of history for a two-character edit. A row insert moves *every cell below it*, so
+    /// recording that as a per-cell patch would be the same snapshot with extra bookkeeping — and it
+    /// still could not describe a tab being deleted or reordered, which is not a change to cells at
+    /// all.
+    ///
+    /// The snapshot is cheaper than it looks: `SheetData` is a value type, so the tabs an edit did
+    /// not touch share storage with the ones already held, and only the edited tab's cell
+    /// dictionary is actually copied.
+    enum Change {
+        /// Cells, keyed by tab index. A `nil` cell means it did not exist.
+        ///
+        /// Keyed by tab rather than carrying a single index because one edit really can touch two:
+        /// cutting from one sheet and pasting into another clears the source and writes the
+        /// destination, and undo has to put both back or it puts back neither.
+        ///
+        /// `tables` carries a tab's whole ``TableRegion`` list for the edits that change it — whole
+        /// lists rather than per-region patches, because applying a table style *replaces* whatever
+        /// it overlaps, which is a change to the list as a unit. Absent for every edit that touches
+        /// only cells, which is nearly all of them.
+        case cells(before: [Int: CellChanges], after: [Int: CellChanges],
+                   tablesBefore: [Int: [TableRegion]] = [:], tablesAfter: [Int: [TableRegion]] = [:])
+
+        /// Epic 10 — the whole tab list, before and after. Structural edits, resizes and every tab
+        /// operation.
+        case workbook(before: [SheetData], after: [SheetData])
+    }
+
+    let change: Change
 
     /// The tab that was showing before the edit, and the one to show after it — so undoing a paste
-    /// made on another tab takes you back to where it happened rather than silently rewriting
-    /// cells you cannot see.
+    /// made on another tab takes you back to where it happened rather than silently rewriting cells
+    /// you cannot see.
     let sheetBefore: Int
     let sheetAfter: Int
 
@@ -43,15 +55,9 @@ struct WorkbookEdit {
     /// A label for the menu item, e.g. "Undo Paste".
     let name: String
 
-    init(before: [Int: CellChanges], after: [Int: CellChanges],
-         tablesBefore: [Int: [TableRegion]] = [:], tablesAfter: [Int: [TableRegion]] = [:],
-         sheetBefore: Int, sheetAfter: Int,
-         selectionBefore: SheetSelection?, selectionAfter: SheetSelection?,
-         name: String) {
-        self.before = before
-        self.after = after
-        self.tablesBefore = tablesBefore
-        self.tablesAfter = tablesAfter
+    init(change: Change, sheetBefore: Int, sheetAfter: Int,
+         selectionBefore: SheetSelection?, selectionAfter: SheetSelection?, name: String) {
+        self.change = change
         self.sheetBefore = sheetBefore
         self.sheetAfter = sheetAfter
         self.selectionBefore = selectionBefore
@@ -90,14 +96,14 @@ struct EditHistory {
         redoStack.removeAll()
     }
 
-    /// Moves one edit onto the redo stack and hands it back. The caller applies its `before`.
+    /// Moves one edit onto the redo stack and hands it back. The caller applies its "before" side.
     mutating func undo() -> WorkbookEdit? {
         guard let edit = undoStack.popLast() else { return nil }
         redoStack.append(edit)
         return edit
     }
 
-    /// The inverse. The caller applies the returned edit's `after`.
+    /// The inverse. The caller applies the returned edit's "after" side.
     mutating func redo() -> WorkbookEdit? {
         guard let edit = redoStack.popLast() else { return nil }
         undoStack.append(edit)

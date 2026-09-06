@@ -38,6 +38,32 @@ struct GridMetrics: Equatable {
     }
 }
 
+// MARK: - FrozenPanes
+
+/// Epic 10 — "Freeze panes": how many rows off the top and columns off the left stay put while the
+/// rest of the grid scrolls under them.
+///
+/// A view setting, not a workbook one — the file format has no field for it. See
+/// ``SheetEditorModel/frozen``.
+struct FrozenPanes: Equatable, CustomStringConvertible {
+
+    /// Rows frozen at the top, 0 for none.
+    var rows: Int = 0
+    /// Columns frozen at the left.
+    var columns: Int = 0
+
+    var isEmpty: Bool { rows <= 0 && columns <= 0 }
+
+    /// What the confirmation says: "2 rows", "1 column", "2 rows and 1 column".
+    var description: String {
+        let parts = [
+            rows > 0 ? "\(rows) row\(rows == 1 ? "" : "s")" : nil,
+            columns > 0 ? "\(columns) column\(columns == 1 ? "" : "s")" : nil,
+        ].compactMap { $0 }
+        return parts.isEmpty ? "nothing" : parts.joined(separator: " and ")
+    }
+}
+
 // MARK: - GridGeometry
 
 /// Maps between cell addresses and points, and answers "what is on screen right now".
@@ -80,9 +106,14 @@ struct GridGeometry {
     ///   - metrics: **unscaled**. Zoom is applied here, to the workbook's own widths as well as to
     ///     the defaults — scaling only the defaults would leave every column the user (or the web
     ///     app) had resized stuck at its unzoomed width while the rest of the grid grew around it.
+    ///   - hiddenRows: **1-based** rows a column filter is hiding, laid out at zero height. Epic 10
+    ///     keeps them in the grid rather than removing them from the workbook, which is what makes a
+    ///     filter something you can take off again — and it is what the web app does (it sets those
+    ///     rows to height 0 too).
     ///   - minimumExtent: how much empty grid to lay out past the populated cells, so a user can
     ///     scroll into blank space and start typing rather than hitting a wall at the last cell.
-    init(sheet: SheetData?, metrics: GridMetrics, minimumExtent: (columns: Int, rows: Int) = (26, 100)) {
+    init(sheet: SheetData?, metrics: GridMetrics, hiddenRows: Set<Int> = [],
+         minimumExtent: (columns: Int, rows: Int) = (26, 100)) {
         self.metrics = metrics
         defaultColumnWidth = metrics.defaultColumnWidth * metrics.zoom
         defaultRowHeight = metrics.defaultRowHeight * metrics.zoom
@@ -101,7 +132,12 @@ struct GridGeometry {
         }
         var rowOffsets = [Double](repeating: 0, count: rows + 1)
         for index in 0..<rows {
-            let height = (sheet?.height(ofRow: index) ?? metrics.defaultRowHeight) * metrics.zoom
+            // A filtered row collapses to nothing, exactly as a row hidden by storing height 0
+            // does. The two are deliberately indistinguishable to everything downstream — hit
+            // testing, the renderer and the selection all only ever ask how tall a row is.
+            let height = hiddenRows.contains(index + 1)
+                ? 0
+                : (sheet?.height(ofRow: index) ?? metrics.defaultRowHeight) * metrics.zoom
             rowOffsets[index + 1] = rowOffsets[index] + max(0, height)
         }
         self.columnOffsets = columnOffsets

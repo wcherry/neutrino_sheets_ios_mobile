@@ -1,4 +1,5 @@
 import XCTest
+import NeutrinoCore
 @testable import NeutrinoSheets
 
 /// Epic 4 — Drive integration. The listings all pass `?type=sheet`, which is the only thing keeping

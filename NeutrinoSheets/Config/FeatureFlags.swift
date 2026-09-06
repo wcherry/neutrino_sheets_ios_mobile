@@ -43,6 +43,15 @@ enum FeatureFlags {
     /// build with ``cellEditing`` off are both unaffected by this flag.
     static let formatting: Bool = true
 
+    /// Epic 10 — structure: insert and delete rows and columns, resize, hide and show, freeze
+    /// panes, the tab operations, sort, per-column filters and find & replace.
+    ///
+    /// Switching this off leaves Epics 8 and 9 — a workbook's cells can still be edited and
+    /// formatted, and a workbook whose rows were inserted on the web still opens correctly, because
+    /// nothing here changes how a file is read. Like ``formatting``, it does not switch editing
+    /// *on*: every command behind it goes through the same `isEditable` guard a typed value does.
+    static let structure: Bool = true
+
     /// Epic 25 — accepting inbound `https://www.getneutrino.app/open/sheet/<id>` Universal Links.
     ///
     /// Off, and deliberately: the deployed `apple-app-site-association` still routes `/open/sheet/*`

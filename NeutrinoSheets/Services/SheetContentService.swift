@@ -1,11 +1,18 @@
 import Foundation
 import Sodium
 import os.log
+import NeutrinoCore
+import NeutrinoAuth
+import NeutrinoCrypto
 
 // MARK: - SheetContentError
 
 enum SheetContentError: LocalizedError {
     case noEncryptionKey
+    /// This device holds an identity, but not the version this spreadsheet's DEK was sealed to.
+    /// Named separately from `noEncryptionKey` because it sends the user somewhere else: not
+    /// "import your key" but "this account rotated and this device is missing a version".
+    case missingKeyVersion(Int)
     case encryptionFailed
     case decryptionFailed
     case notAuthenticated
@@ -22,6 +29,8 @@ enum SheetContentError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .noEncryptionKey:  return "No encryption key found. Import your key before opening or creating spreadsheets."
+        case .missingKeyVersion(let version):
+            return "This spreadsheet needs encryption key version \(version), which this device does not have. Scanning the key code again will not help \u{2014} it carries one key. On the computer that holds your key, open Settings \u{203A} Encryption and back up your older keys, then reopen this app."
         case .encryptionFailed: return "Failed to encrypt the spreadsheet."
         case .decryptionFailed: return "Failed to decrypt the spreadsheet."
         case .notAuthenticated: return "You are not signed in."
@@ -34,6 +43,31 @@ enum SheetContentError: LocalizedError {
         case .contentVersionConflict:
             return "This spreadsheet changed on another device since it was opened. Reload to get the latest version, or keep your copy."
         }
+    }
+}
+
+// MARK: - SealedFileKey
+
+/// A spreadsheet's DEK as the server holds it: the sealed blob, and which of the caller's identity
+/// versions it was sealed to.
+///
+/// The two travel together everywhere because they are only meaningful together. Passing the blob
+/// alone is what let a rotated account's older spreadsheets fail to open — the caller had no way to
+/// know which key to reach for, so it always reached for the newest.
+struct SealedFileKey: Equatable {
+    let sealed: String
+    let keyVersion: Int
+
+    init(sealed: String, keyVersion: Int) {
+        self.sealed = sealed
+        self.keyVersion = keyVersion
+    }
+
+    /// A ref written before versioning carries no version. Read as 1, which is what the server
+    /// defaults `file_key_refs.key_version` to for the same rows.
+    fileprivate init(_ response: APIKeyResponse) {
+        self.sealed = response.encryptedFileKey
+        self.keyVersion = response.keyVersion ?? 1
     }
 }
 
@@ -146,7 +180,7 @@ final class SheetContentService: ObservableObject {
 
         // A spreadsheet whose key ref failed to store is unreadable, so this is allowed to throw
         // rather than being fire-and-forget.
-        try await storeFileKey(fileID: created.id, encryptedFileKey: try sealDEK(dek), token: token)
+        try await storeFileKey(fileID: created.id, sealedFileKey: try sealDEK(dek), token: token)
         logger.debug("createSpreadsheet succeeded: id=\(created.id, privacy: .public)")
 
         var item = SheetItem(
@@ -236,10 +270,10 @@ final class SheetContentService: ObservableObject {
     /// failed decryption as plaintext safe.
     private func resolveDEK(fileID: String, token: String) async throws -> (dek: Bytes, isNew: Bool) {
         if let sealed = try await fetchSealedDEK(fileID: fileID, token: token) {
-            return (try unsealDEK(sealed), false)
+            return (try unsealDEK(sealed.sealed, keyVersion: sealed.keyVersion), false)
         }
         let dek: Bytes = Self.sodium.secretStream.xchacha20poly1305.key()
-        try await storeFileKey(fileID: fileID, encryptedFileKey: try sealDEK(dek), token: token)
+        try await storeFileKey(fileID: fileID, sealedFileKey: try sealDEK(dek), token: token)
         logger.debug("resolveDEK: generated a new key for id=\(fileID, privacy: .public)")
         return (dek, true)
     }
@@ -371,8 +405,13 @@ final class SheetContentService: ObservableObject {
         return Data(plaintext)
     }
 
-    /// Seals `dek` to the caller's stored Curve25519 public key (`crypto_box_seal`).
-    func sealDEK(_ dek: Bytes) throws -> String {
+    /// Seals `dek` to the caller's **active** Curve25519 public key (`crypto_box_seal`), and
+    /// reports which version that was.
+    ///
+    /// The version travels with the sealed key because the server records it on the key ref, and a
+    /// ref that names the wrong version is a spreadsheet nothing can open: the web client reaches
+    /// for the key the ref names, not the one it was actually sealed to.
+    func sealDEK(_ dek: Bytes) throws -> SealedFileKey {
         guard let pubKeyString = KeychainService.load(forKey: KeyImportService.publicKeyKeychainKey),
               let pubKeyData = Data(base64URLEncoded: pubKeyString) else {
             throw SheetContentError.noEncryptionKey
@@ -381,16 +420,35 @@ final class SheetContentService: ObservableObject {
               let b64 = Self.sodium.utils.bin2base64(sealed, variant: .URLSAFE_NO_PADDING) else {
             throw SheetContentError.encryptionFailed
         }
-        return b64
+        return SealedFileKey(sealed: b64, keyVersion: KeyImportService.activeKeyVersion())
     }
 
-    /// Reverses ``sealDEK(_:)`` using the caller's stored private key (`crypto_box_seal_open`).
-    func unsealDEK(_ sealedBase64: String) throws -> Bytes {
-        guard let pubKeyString = KeychainService.load(forKey: KeyImportService.publicKeyKeychainKey),
-              let pubKeyData = Data(base64URLEncoded: pubKeyString),
-              let privKeyString = KeychainService.load(forKey: KeyImportService.privateKeyKeychainKey),
-              let privKeyData = Data(base64URLEncoded: privKeyString) else {
-            logger.error("unsealDEK: no stored key pair, or the stored key is not valid Base64URL")
+    /// Reverses ``sealDEK(_:)``, resolving `keyVersion` against the keys this device holds.
+    ///
+    /// `keyVersion` defaults to 1 because key refs written before rotation existed carry no
+    /// version, and the server defaults the column to 1 for the same reason.
+    ///
+    /// A version this device lacks is reported as `missingKeyVersion` rather than as a decrypt
+    /// failure. The distinction is the whole point of the versioning: the ciphertext is fine, the
+    /// DEK is fine, and what is missing is one key that can still be brought across.
+    func unsealDEK(_ sealedBase64: String, keyVersion: Int = 1) throws -> Bytes {
+        let publicKeyString: String
+        let privateKeyString: String
+        switch KeyImportService.keyPair(forVersion: keyVersion) {
+        case .found(let publicKey, let privateKey):
+            publicKeyString = publicKey
+            privateKeyString = privateKey
+        case .noKey:
+            logger.error("unsealDEK: this device holds no encryption key")
+            throw SheetContentError.noEncryptionKey
+        case .missingVersion(let version):
+            logger.error("unsealDEK: no key for version \(version, privacy: .public)")
+            throw SheetContentError.missingKeyVersion(version)
+        }
+
+        guard let pubKeyData = Data(base64URLEncoded: publicKeyString),
+              let privKeyData = Data(base64URLEncoded: privateKeyString) else {
+            logger.error("unsealDEK: the stored key is not valid Base64URL")
             throw SheetContentError.noEncryptionKey
         }
         guard let sealedBytes = Self.sodium.utils.base642bin(sealedBase64, variant: .URLSAFE_NO_PADDING) else {
@@ -402,7 +460,7 @@ final class SheetContentService: ObservableObject {
             recipientPublicKey: Array(pubKeyData),
             recipientSecretKey: Array(privKeyData)
         ) else {
-            logger.error("unsealDEK: seal was not made to this device's public key")
+            logger.error("unsealDEK: seal was not made to key version \(keyVersion, privacy: .public)")
             throw SheetContentError.decryptionFailed
         }
         return dek
@@ -482,7 +540,7 @@ final class SheetContentService: ObservableObject {
 
     /// Returns nil when the file has no key ref yet — a 404 here means "not encrypted *yet*", which
     /// is a normal state for a file the server created and nobody has opened.
-    private func fetchSealedDEK(fileID: String, token: String) async throws -> String? {
+    private func fetchSealedDEK(fileID: String, token: String) async throws -> SealedFileKey? {
         let request = try makeRequest(method: "GET", path: "/api/v1/drive/files/\(fileID)/key", token: token)
         let (data, response) = try await self.data(for: request)
         if let http = response as? HTTPURLResponse, http.statusCode == 404 { return nil }
@@ -490,7 +548,7 @@ final class SheetContentService: ObservableObject {
         do {
             let decoder = JSONDecoder()
             decoder.keyDecodingStrategy = .convertFromSnakeCase
-            return try decoder.decode(APIKeyResponse.self, from: data).encryptedFileKey
+            return SealedFileKey(try decoder.decode(APIKeyResponse.self, from: data))
         } catch {
             throw SheetContentError.decodingError(underlying: error)
         }
@@ -503,12 +561,17 @@ final class SheetContentService: ObservableObject {
         return data
     }
 
-    private func storeFileKey(fileID: String, encryptedFileKey: String, token: String) async throws {
+    private func storeFileKey(fileID: String, sealedFileKey: SealedFileKey, token: String) async throws {
         var request = try makeRequest(method: "PUT",
                                       path: "/api/v1/drive/files/\(fileID)/key",
                                       token: token)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONEncoder().encode(["encryptedFileKey": encryptedFileKey])
+        // `keyVersion` is sent, not left to the server's default of 1. Omitting it on a rotated
+        // account files a spreadsheet sealed to v3 under v1, and every client — this one included
+        // — then reaches for the wrong key and cannot open a file that is perfectly intact.
+        request.httpBody = try JSONEncoder().encode(
+            SetFileKeyBody(encryptedFileKey: sealedFileKey.sealed, keyVersion: sealedFileKey.keyVersion)
+        )
         let (_, response) = try await data(for: request)
         try Self.checkStatus(response)
     }
@@ -537,6 +600,17 @@ private struct APIFileResponse: Decodable {
 
 private struct APIKeyResponse: Decodable {
     let encryptedFileKey: String
+    /// Which of the caller's identity versions the DEK is sealed to. Optional so a server that
+    /// predates versioning still decodes; `SealedFileKey` reads a missing value as 1, matching the
+    /// column's own default.
+    let keyVersion: Int?
+}
+
+/// `PUT /drive/files/{id}/key`. `keyVersion` says which entry of the caller's keyring the sealed
+/// DEK belongs to, so a later read reaches for the right one.
+private struct SetFileKeyBody: Encodable {
+    let encryptedFileKey: String
+    let keyVersion: Int
 }
 
 // MARK: - Data + Base64URL

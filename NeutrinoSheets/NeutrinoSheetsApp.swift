@@ -1,4 +1,8 @@
 import SwiftUI
+import NeutrinoCore
+import NeutrinoAuth
+import NeutrinoCrypto
+import NeutrinoUI
 
 // MARK: - NeutrinoSheetsApp
 
@@ -14,16 +18,39 @@ struct NeutrinoSheetsApp: App {
 
     // MARK: - Services
 
-    @StateObject private var authService = AuthService()
-    @StateObject private var settings = AppSettings()
-    @StateObject private var biometricService = BiometricAuthService()
-    @StateObject private var deviceSessionService = DeviceSessionService()
-    @StateObject private var driveService = SheetsDriveService()
-    @StateObject private var contentService = SheetContentService()
-    @StateObject private var networkMonitor = NetworkMonitor()
-    @StateObject private var deepLinkRouter = DeepLinkRouter()
+    // Built in `init()` rather than given default values here: defaults are evaluated before the
+    // initializer body runs, and the shared services resolve their Keychain namespace through
+    // `NeutrinoApp.current` the moment they are constructed.
+    @StateObject private var authService: AuthService
+    @StateObject private var settings: AppSettings
+    @StateObject private var biometricService: BiometricAuthService
+    @StateObject private var deviceSessionService: DeviceSessionService
+    @StateObject private var driveService: SheetsDriveService
+    @StateObject private var contentService: SheetContentService
+    @StateObject private var networkMonitor: NetworkMonitor
+    @StateObject private var deepLinkRouter: DeepLinkRouter
 
     @Environment(\.scenePhase) private var scenePhase
+
+    // MARK: - Init
+
+    init() {
+        // Before anything else. `nsheet.*` is what previous builds wrote, so this reads the
+        // existing session and the already-imported encryption key rather than starting cold.
+        NeutrinoApp.configure(.sheets)
+        NeutrinoBrand.use(.sheets)
+
+        _authService = StateObject(wrappedValue: AuthService())
+        _settings = StateObject(wrappedValue: AppSettings())
+        _biometricService = StateObject(wrappedValue: BiometricAuthService(
+            isFeatureEnabled: FeatureFlags.biometricLock
+        ))
+        _deviceSessionService = StateObject(wrappedValue: DeviceSessionService())
+        _driveService = StateObject(wrappedValue: SheetsDriveService())
+        _contentService = StateObject(wrappedValue: SheetContentService())
+        _networkMonitor = StateObject(wrappedValue: NetworkMonitor())
+        _deepLinkRouter = StateObject(wrappedValue: DeepLinkRouter())
+    }
 
     // MARK: - Scene
 
@@ -65,6 +92,15 @@ struct NeutrinoSheetsApp: App {
         deviceSessionService.authService = authService
 
         biometricService.lockOnLaunch()
+
+        // Top up this device's retired keys from the account's key file. Enrolment already does
+        // this, so on a healthy install it finds nothing; it is here for the device enrolled before
+        // the key file existed, and for the one that was offline when its key arrived. One request,
+        // and a failure is not worth surfacing — the next launch tries again.
+        KeyFileService.shared.authService = authService
+        if authService.isAuthenticated && KeyImportService.hasStoredKeys() {
+            Task { try? await KeyFileService.shared.restoreArchivedKeys() }
+        }
 
         if authService.isAuthenticated {
             await authService.refreshTokenIfNeeded()
