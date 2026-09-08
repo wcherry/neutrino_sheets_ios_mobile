@@ -37,7 +37,7 @@ final class SheetEditorModelTests: XCTestCase {
     private func stubLoad(workbook: String, role: String = "owner") throws {
         let dek = Sodium().secretStream.xchacha20poly1305.key()
         let sealed = try service.sealDEK(dek)
-        let ciphertext = try service.encrypt(text: workbook, dek: dek,
+        let ciphertext = try service.encrypt(data: Fixture.package(workbookJSON: workbook), dek: dek,
                                              xcss: Sodium().secretStream.xchacha20poly1305)
         MockURLProtocol.handler = { request in
             let path = request.url?.path ?? ""
@@ -52,7 +52,11 @@ final class SheetEditorModelTests: XCTestCase {
                  "yourRole":"\(role)","contentVersion":4}
                 """.utf8))
             }
-            if path.hasSuffix("/key") { return ok(Data("{\"encrypted_file_key\":\"\(sealed)\"}".utf8)) }
+            if path.hasSuffix("/key") {
+                return ok(Data("""
+                {"encrypted_file_key":"\(sealed.sealed)","key_version":\(sealed.keyVersion)}
+                """.utf8))
+            }
             if request.httpMethod == "PUT" {
                 return ok(Data("""
                 {"id":"s1","name":"Budget","folderId":null,"sizeBytes":42,

@@ -147,7 +147,8 @@ struct SheetBrowserView: View {
                 }
             }
 
-            // Duplicating a raw .xlsx would mean decoding it, which is Epic 23's job.
+            // Duplicating goes through this app's codec, so it is offered for a spreadsheet and not
+            // for whatever else a shared listing may hold.
             if item.isNativeSheet {
                 Button {
                     duplicate(item)
@@ -293,11 +294,6 @@ struct SheetRowView: View {
     }
 
     private var subtitle: String {
-        // A raw .xlsx is listed but cannot be opened yet, and saying so in the row is kinder than
-        // letting the user tap into an error.
-        if item.isOfficeSpreadsheet {
-            return "Excel file · not supported yet"
-        }
         var parts = [Self.dateFormatter.localizedString(for: item.modifiedAt, relativeTo: Date())]
         if let size = item.size, item.type == .file {
             parts.append(ByteCountFormatter.string(fromByteCount: size, countStyle: .file))

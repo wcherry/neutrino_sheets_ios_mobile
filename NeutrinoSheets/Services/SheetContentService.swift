@@ -4,6 +4,7 @@ import os.log
 import NeutrinoCore
 import NeutrinoAuth
 import NeutrinoCrypto
+import NeutrinoOOXML
 
 // MARK: - SheetContentError
 
@@ -38,7 +39,7 @@ enum SheetContentError: LocalizedError {
         case .serverError(let code): return "Server error (\(code))."
         case .decodingError(let err): return "Failed to read server response: \(err.localizedDescription)"
         case .notASpreadsheet:
-            return "This file isn\u{2019}t a Neutrino spreadsheet. Opening Excel files on iOS is not supported yet."
+            return "This file isn\u{2019}t a spreadsheet."
         case .notFound:         return "That spreadsheet is no longer available."
         case .contentVersionConflict:
             return "This spreadsheet changed on another device since it was opened. Reload to get the latest version, or keep your copy."
@@ -89,8 +90,10 @@ struct SealedFileKey: Equatable {
 /// 1. **"Is this a spreadsheet?"** — `/info` answers for any file type. See ``fileInfo(for:)``.
 /// 2. **Naive timestamps** — Drive serialises `2026-08-10T12:00:00` with no offset, meaning UTC.
 ///    Handled by `DriveDate`, which reads a zone-less timestamp as UTC rather than local.
-/// 3. **The seeded default body** — a new file holds a FortuneSheet-shaped *array*, not
-///    `{"sheets":[…]}`. Handled by ``SheetFile/decode(from:)``.
+/// 3. **The body of a new file** — an OOXML file is created with no content at all, because an
+///    `.xlsx` is a zip the server has no business building. ``createSpreadsheet(name:parentID:body:)``
+///    writes a real, sealed workbook straight after the create, and ``SheetFile/decode(from:)``
+///    reads the gap in between as an empty workbook rather than an error.
 ///
 /// ## What is never logged
 ///
@@ -136,24 +139,21 @@ final class SheetContentService: ObservableObject {
 
     /// Creates a spreadsheet and returns it.
     ///
-    /// **One request, not two.** `POST /drive/files` takes a *client-supplied* id and seeds the body
-    /// itself from the mime-type registry, so the create and the first content write are a single
-    /// round trip — and the caller can open the editor on the id it generated without waiting for
-    /// the response. The Docs app's older `POST /drive/files/upload` two-step is deliberately not
-    /// followed here.
+    /// `POST /drive/files` takes a *client-supplied* id, so the caller can open the editor on the id
+    /// it generated without waiting for the response. The Docs app's older
+    /// `POST /drive/files/upload` two-step is deliberately not followed here.
     ///
-    /// The key is stored in a second call because the create endpoint has no field for it. That is
-    /// the same shape the web app uses: create, then `PUT /files/{id}/key`.
+    /// The key is stored in a second call because the create endpoint has no field for it, and the
+    /// body in a third. That is the same shape the web app uses: create, `PUT /files/{id}/key`,
+    /// then autosave.
     ///
-    /// - Parameter body: content to write instead of leaving the server's default — used by
-    ///   Duplicate.
+    /// The body cannot ride along in `initialContent`, which would be the obvious shortcut and is
+    /// wrong: the server writes that field with `write_text_content`, verbatim and unencrypted.
+    /// Putting ciphertext there would store Base64 *text* that no subsequent load could decrypt, and
+    /// putting the package there would leave a copy of the original's contents in plaintext on the
+    /// server. So the field is left nil and the real body goes up encrypted through autosave.
     ///
-    ///   It is written by a *second* request rather than through `initialContent`, which would be
-    ///   the obvious shortcut and is wrong: the server writes that field with `write_text_content`,
-    ///   verbatim and unencrypted. Putting ciphertext there would store Base64 *text* that no
-    ///   subsequent load could decrypt, and putting the JSON there would leave a copy of the
-    ///   original's contents in plaintext on the server. So the field is left nil, the file is
-    ///   created with the seeded default, and the real body goes up encrypted through autosave.
+    /// - Parameter body: content to write instead of an empty workbook — used by Duplicate.
     func createSpreadsheet(name: String, parentID: String?,
                            body: SheetFile? = nil) async throws -> SheetItem {
         let id = UUID().uuidString
@@ -162,8 +162,8 @@ final class SheetContentService: ObservableObject {
 
         let dek: Bytes = Self.sodium.secretStream.xchacha20poly1305.key()
 
-        let request = APICreateFileRequest(id: id, name: name, mimeType: SheetItem.sheetMIME,
-                                           folderId: parentID)
+        let request = APICreateFileRequest(id: id, name: XlsxCodec.withExtension(name),
+                                           mimeType: SheetItem.sheetMIME, folderId: parentID)
         var urlRequest = try makeRequest(method: "POST", path: "/api/v1/drive/files", token: token)
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         urlRequest.httpBody = try JSONEncoder().encode(request)
@@ -190,11 +190,16 @@ final class SheetContentService: ObservableObject {
         )
         item.contentVersion = created.contentVersion
 
-        if let body {
+        // Always written, even for a brand-new spreadsheet with no body of its own. `POST
+        // /drive/files` creates an OOXML file with *no content at all* — an `.xlsx` is a zip the
+        // server has no business building, and a seed it wrote would sit in object storage in the
+        // clear — so this first save is what makes the file both a real workbook and an encrypted
+        // one. Without it a new spreadsheet downloads as zero bytes, which Excel cannot open.
+        do {
             // The DEK is carried over rather than re-fetched: the key was generated on this device
             // moments ago, and going back to `/files/{id}/key` for it would be a round trip to be
             // told something already known.
-            let saved = try await save(body, to: item.id, dek: dek,
+            let saved = try await save(body ?? .empty, to: item.id, dek: dek,
                                        expectedContentVersion: item.contentVersion)
             item.modifiedAt = saved.updatedAt
             item.size = saved.sizeBytes
@@ -214,6 +219,10 @@ final class SheetContentService: ObservableObject {
         /// True when the server still holds the plaintext body it seeded at create time, so the
         /// first save has to encrypt it. See ``loadWorkbook(for:)``.
         var needsInitialEncryption: Bool
+        /// The `.xlsx` this session opened, kept so a save can carry forward the parts neither this
+        /// app nor the web understands — a pivot table, an image, a chart Excel wrote. Nil when the
+        /// stored body was not a package, which for a spreadsheet means it had no content yet.
+        var sourcePackage: Data?
     }
 
     /// Downloads, decrypts and decodes a workbook.
@@ -256,12 +265,13 @@ final class SheetContentService: ObservableObject {
             plaintext = stored
         }
 
-        // Lenient by contract, not by accident: the seeded body is a FortuneSheet array and an
-        // unreadable body is an empty workbook. See `SheetFile.decode(from:)`.
+        // Lenient by contract, not by accident: a spreadsheet created moments ago has no content at
+        // all, and that is an empty workbook rather than an error. See `SheetFile.decode(from:)`.
         let file = SheetFile.decode(from: plaintext)
         logger.debug("loadWorkbook succeeded: id=\(fileID, privacy: .public) sheets=\(file.sheets.count)")
         return LoadedWorkbook(file: file, dek: dek, info: info,
-                              needsInitialEncryption: needsInitialEncryption)
+                              needsInitialEncryption: needsInitialEncryption,
+                              sourcePackage: XlsxCodec.isWorkbook(plaintext) ? plaintext : nil)
     }
 
     /// Fetches the file's sealed DEK, generating and storing one if the file has none yet.
@@ -301,15 +311,19 @@ final class SheetContentService: ObservableObject {
     ///
     /// Note that autosave deliberately does *not* snapshot a version server-side; only an explicit
     /// `POST /versions` does (Epic 13).
+    ///
+    /// `keeping` is the package this save replaces — ``LoadedWorkbook/sourcePackage`` for the
+    /// session — so a workbook that has been through Excel keeps the parts neither implementation
+    /// models rather than being stripped by the first edit made on a phone.
     @discardableResult
     func save(_ file: SheetFile, to fileID: String, dek: Bytes,
-              expectedContentVersion: Int? = nil, title: String? = nil) async throws -> SaveResult {
+              expectedContentVersion: Int? = nil, title: String? = nil,
+              keeping previous: Data? = nil) async throws -> SaveResult {
         logger.debug("save: id=\(fileID, privacy: .public)")
         let token = try await authorizedToken()
 
         let xcss = Self.sodium.secretStream.xchacha20poly1305
-        let plaintext = String(decoding: try file.encoded(), as: UTF8.self)
-        let ciphertext = try encrypt(text: plaintext, dek: dek, xcss: xcss)
+        let ciphertext = try encrypt(data: try file.encoded(keeping: previous), dek: dek, xcss: xcss)
 
         // The autosave endpoint expects a multipart "file" part — sending raw bytes as
         // application/octet-stream trips actix-multipart's ContentTypeIncompatible check.
@@ -371,17 +385,20 @@ final class SheetContentService: ObservableObject {
 
     // MARK: - Crypto (internal, for unit testing)
 
-    /// Encrypts `text` as `[24-byte header][ciphertext]` using an XChaCha20-Poly1305 secretstream.
-    func encrypt(text: String, dek: Bytes, xcss: SecretStream.XChaCha20Poly1305) throws -> Data {
+    /// Encrypts `data` as `[24-byte header][ciphertext]` using an XChaCha20-Poly1305 secretstream.
+    ///
+    /// Takes bytes rather than text because a workbook is an `.xlsx` — a zip, which is not UTF-8 and
+    /// would not survive being carried through a `String`.
+    func encrypt(data: Data, dek: Bytes, xcss: SecretStream.XChaCha20Poly1305) throws -> Data {
         guard let stream = xcss.initPush(secretKey: dek) else { throw SheetContentError.encryptionFailed }
         let header = stream.header()
-        guard let cipher = stream.push(message: Array(text.utf8), tag: .FINAL) else {
+        guard let cipher = stream.push(message: Array(data), tag: .FINAL) else {
             throw SheetContentError.encryptionFailed
         }
         return Data(header + cipher)
     }
 
-    /// Reverses ``encrypt(text:dek:xcss:)``.
+    /// Reverses ``encrypt(data:dek:xcss:)``.
     ///
     /// Returns `Data` rather than `String` because the caller has to be able to hand the *stored*
     /// bytes to the JSON decoder when decryption fails on a plaintext seed, and a lossy

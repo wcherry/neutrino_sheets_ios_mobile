@@ -12,19 +12,31 @@ final class ModelTests: XCTestCase {
 
     // MARK: - SheetItem
 
-    func testNativeSheetsAreDistinguishedFromOfficeFiles() {
+    func testASpreadsheetIsAnXlsxAndNothingElseIs() {
+        XCTAssertEqual(SheetItem.sheetMIME,
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         XCTAssertTrue(Fixture.sheet().isNativeSheet)
-        XCTAssertFalse(Fixture.sheet(mimeType: SheetItem.xlsxMIME).isNativeSheet)
-        XCTAssertTrue(Fixture.sheet(mimeType: SheetItem.xlsxMIME).isOfficeSpreadsheet)
         XCTAssertFalse(Fixture.folder().isNativeSheet)
     }
 
-    func testDisplayNameKeepsPlainSpreadsheetNames() {
-        // Unlike a Neutrino Doc, a spreadsheet has no extension to hide.
-        XCTAssertEqual(Fixture.sheet(name: "Q3 Budget").displayName, "Q3 Budget")
-        // A raw office file does.
-        XCTAssertEqual(Fixture.sheet(name: "Book.xlsx", mimeType: SheetItem.xlsxMIME).displayName,
-                       "Book")
+    /// The bespoke JSON is gone from this app: not migrated, simply no longer a format it reads,
+    /// writes, lists or routes.
+    func testTheBespokeJSONFormatIsNoLongerASpreadsheet() {
+        XCTAssertTrue(SheetItem.isSpreadsheet(SheetItem.sheetMIME))
+        XCTAssertFalse(SheetItem.isSpreadsheet("application/x-neutrino-sheet"))
+        XCTAssertFalse(SheetItem.isSpreadsheet("application/x-neutrino-doc"))
+        XCTAssertFalse(SheetItem.isSpreadsheet("text/csv"))
+        XCTAssertFalse(SheetItem.isSpreadsheet(nil))
+    }
+
+    /// The file is named `Budget.xlsx` because that is what has to land on disk; the title bar says
+    /// `Budget`.
+    func testDisplayNameStripsTheExtensionTheFileNameCarries() {
+        XCTAssertEqual(Fixture.sheet(name: "Book.xlsx").displayName, "Book")
+        // A folder keeps its name whatever it is called.
+        XCTAssertEqual(Fixture.folder(name: "Q3.archive").displayName, "Q3.archive")
+        // Only the modern extension is stripped.
+        XCTAssertEqual(Fixture.sheet(name: "Q3.report").displayName, "Q3.report")
     }
 
     func testDuplicateNameKeepsAnyExtensionLast() {

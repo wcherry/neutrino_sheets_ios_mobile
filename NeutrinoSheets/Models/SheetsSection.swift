@@ -2,15 +2,15 @@ import Foundation
 
 // MARK: - SheetsSection
 
-/// The top-level sections of the Drive browser (Epic 1 — "Tabs", Epic 4 — "Browse with `?type=sheet`").
+/// The top-level sections of the Drive browser (Epic 1 — "Tabs", Epic 4 — "Browse Drive").
 enum SheetsSection: String, CaseIterable, Identifiable {
     /// The user's own spreadsheets, navigable by folder.
     case home      = "Home"
-    /// `GET /api/v1/drive/recent?type=sheet` — most recently modified, newest first.
+    /// `GET /api/v1/drive/recent` — most recently modified, newest first.
     case recent    = "Recent"
-    /// `GET /api/v1/drive/starred?type=sheet` — Drive's `isStarred` flag.
+    /// `GET /api/v1/drive/starred` — Drive's `isStarred` flag.
     case favorites = "Favorites"
-    /// `GET /api/v1/drive/shared-with-me?type=sheet` — spreadsheets other people own.
+    /// `GET /api/v1/drive/shared-with-me` — spreadsheets other people own.
     case shared    = "Shared"
     case trash     = "Trash"
 

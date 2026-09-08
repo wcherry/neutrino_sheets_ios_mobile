@@ -1,4 +1,5 @@
 import Foundation
+import NeutrinoOOXML
 
 // MARK: - SheetItem
 
@@ -14,19 +15,29 @@ struct SheetItem: Identifiable, Hashable {
 
     // MARK: - MIME
 
-    /// The MIME type that *makes* a Drive file a spreadsheet.
+    /// What a Neutrino spreadsheet is: a real Excel workbook.
     ///
-    /// Since `40842e2` there is no `sheets` marker table and no `/api/v1/sheets` CRUD resource:
-    /// membership in the server's `native_types` registry is the marker, and this string is the key
-    /// into it (`src/drive/storage/native_types.rs`). It is also what the server's `type=sheet`
-    /// filter matches, and what the client-side "is this a spreadsheet?" check in
-    /// ``SheetContentService/fileInfo(for:)`` compares against.
-    static let sheetMIME = "application/x-neutrino-sheet"
+    /// A spreadsheet created by any Neutrino client is an `.xlsx` (`src/drive/storage/native_types.rs`,
+    /// issue #127), which this app reads and writes through `NeutrinoOOXML` — so Excel, LibreOffice
+    /// and Google's editors open one directly, and import and export are file copies.
+    ///
+    /// The bespoke `application/x-neutrino-sheet` JSON that predates it is gone from this app. Not
+    /// migrated — there was nothing left to migrate — simply no longer a format it reads, writes,
+    /// lists or routes.
+    static let sheetMIME = XlsxCodec.mimeType
 
-    /// Raw `.xlsx`, which Drive stores but this app cannot open yet — office mode is Epic 23.
-    /// Recognised so a listing can show the file and say why it will not open, rather than dropping
-    /// it or failing obscurely.
-    static let xlsxMIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    /// Every MIME type this app browses.
+    ///
+    /// One entry, and it stays a list because that is the shape both call sites want and because
+    /// the server's `type=` filter cannot express "a spreadsheet" on its own — see
+    /// ``SheetsDriveService``.
+    static let spreadsheetMIMEs = [XlsxCodec.mimeType]
+
+    /// Whether a Drive file is a Neutrino spreadsheet.
+    static func isSpreadsheet(_ mimeType: String?) -> Bool {
+        guard let mimeType else { return false }
+        return spreadsheetMIMEs.contains(mimeType)
+    }
 
     // MARK: - Properties
 
@@ -39,7 +50,7 @@ struct SheetItem: Identifiable, Hashable {
     var size: Int64?
     var modifiedAt: Date
     var isTrashed: Bool
-    /// ``sheetMIME`` for native spreadsheets; `nil` for folders.
+    /// One of ``spreadsheetMIMEs`` for spreadsheets; `nil` for folders.
     var mimeType: String?
     /// Drive's `isStarred` flag — the Favorites model shared with the web app, stored on the file or
     /// folder row itself rather than in a list of its own.
@@ -55,36 +66,31 @@ struct SheetItem: Identifiable, Hashable {
 
     /// SF Symbol representing the item in a listing.
     var iconName: String {
-        switch type {
-        case .folder: return "folder.fill"
-        case .file:   return isNativeSheet ? "tablecells.fill" : "doc.fill"
-        }
+        type == .folder ? "folder.fill" : "tablecells.fill"
     }
 
-    /// True when this file is a native Neutrino spreadsheet rather than a raw office file.
+    /// True when this file is a Neutrino spreadsheet.
     ///
     /// This is the client-side check consequence 2 of the roadmap's API section calls for: `/info`
     /// answers for *any* file type now, so nothing server-side will tell the app it opened the
     /// wrong thing.
     var isNativeSheet: Bool {
-        type == .file && mimeType == Self.sheetMIME
+        type == .file && Self.isSpreadsheet(mimeType)
     }
 
-    /// A spreadsheet this app can list but not yet open — a raw `.xlsx`. Office mode (Epic 23) is
-    /// what turns this into something openable.
-    var isOfficeSpreadsheet: Bool {
-        type == .file && mimeType == Self.xlsxMIME
-    }
-
-    /// The title to show. Spreadsheets are stored under their plain name — unlike Neutrino Docs,
-    /// which appends `.md` — so only a raw office file has an extension worth hiding.
+    /// The title to show.
+    ///
+    /// An `.xlsx` is a real workbook and its extension is part of the *file* name — it has to land
+    /// on disk as `Budget.xlsx` to open on a double-click — but the spreadsheet is called "Budget",
+    /// which is what the web library shows too (`stripOoxmlExtension` in `web/packages/api-core`).
     var displayName: String {
-        guard type == .file, isOfficeSpreadsheet else { return name }
-        guard let dot = name.lastIndex(of: "."), dot != name.startIndex else { return name }
-        return String(name[..<dot])
+        type == .file ? XlsxCodec.strippingExtension(name) : name
     }
 
-    /// The name a "Duplicate" should get: `Budget` -> `Budget copy`, `Book.xlsx` -> `Book copy.xlsx`.
+    /// The name a "Duplicate" should get: `Book.xlsx` -> `Book copy.xlsx`.
+    ///
+    /// The extension stays last, because `Book.xlsx copy` is a file the operating system no longer
+    /// recognises.
     var duplicateName: String {
         guard let dot = name.lastIndex(of: "."), dot != name.startIndex else {
             return name + " copy"

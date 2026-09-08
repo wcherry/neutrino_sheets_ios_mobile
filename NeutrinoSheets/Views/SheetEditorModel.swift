@@ -66,6 +66,9 @@ final class SheetEditorModel: ObservableObject {
     private var contentVersion: Int?
     /// True until the plaintext the server seeded at create time has been replaced by ciphertext.
     private var needsInitialEncryption = false
+    /// The `.xlsx` this session opened, handed back to every save so the parts neither this app nor
+    /// the web models — a pivot table, an image, a chart Excel wrote — survive an edit made here.
+    private var sourcePackage: Data?
 
     /// Epic 8 — "Undo / redo".
     private var history = EditHistory()
@@ -175,6 +178,7 @@ final class SheetEditorModel: ObservableObject {
             dek = loaded.dek
             contentVersion = loaded.info.contentVersion
             needsInitialEncryption = loaded.needsInitialEncryption
+            sourcePackage = loaded.sourcePackage
             activeSheetIndex = 0
             selection = SheetSelection(CellAddress(column: 1, row: 1))
             history.clear()
@@ -821,7 +825,10 @@ final class SheetEditorModel: ObservableObject {
         case .cells(let before, let after, let tablesBefore, let tablesAfter):
             write(undoing ? before : after, tables: undoing ? tablesBefore : tablesAfter)
         case .workbook(let before, let after):
-            file?.sheets = undoing ? before : after
+            if var updatedFile = file {
+                updatedFile.sheets = undoing ? before : after
+                file = updatedFile
+            }
         }
         // Clamped, because a tab index recorded before a delete can point past the end of the list
         // the other side of the edit restores.
@@ -1026,7 +1033,8 @@ final class SheetEditorModel: ObservableObject {
 
         do {
             let result = try await contentService.save(file, to: item.id, dek: dek,
-                                                       expectedContentVersion: contentVersion)
+                                                       expectedContentVersion: contentVersion,
+                                                       keeping: sourcePackage)
             contentVersion = result.contentVersion
             needsInitialEncryption = false
             driveService?.spreadsheetWasSaved(itemID: item.id, size: result.sizeBytes,

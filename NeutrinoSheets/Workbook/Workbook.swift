@@ -1,4 +1,5 @@
 import Foundation
+import NeutrinoOOXML
 
 // MARK: - CellStyle
 
@@ -321,51 +322,42 @@ extension SheetFile: Codable {
 
 extension SheetFile {
 
-    /// Decodes a stored workbook body, tolerating everything the server can hand back.
+    /// Decodes a stored workbook body — the bytes of a real `.xlsx`.
     ///
-    /// A `sheet.json` blob is one of three things, and only the first is the shape this type
-    /// describes:
+    /// A spreadsheet *is* an Excel workbook (issue #127): `XlsxCodec` reads the worksheet parts, or
+    /// the `neutrino/model.json` part when the file predates the web's OOXML writer and still
+    /// carries a trustworthy one. Either way what comes back is the same `{"sheets":[…]}` envelope
+    /// this type has always decoded, which is why charts and conditional formats keep riding through
+    /// ``UnknownFields`` untouched.
     ///
-    /// 1. `{"sheets":[…]}` — written by the web editor and by this app.
-    /// 2. `[{"index":"0","name":"Sheet1","celldata":[],…}]` — a **FortuneSheet-shaped array**, which
-    ///    is what `native_types::EMPTY_SHEET_CONTENT` seeds a brand-new file with. Every
-    ///    spreadsheet is this until something saves it. A decoder that required shape 1 would fail
-    ///    to open every newly created spreadsheet, which is the sort of bug that gets found by a
-    ///    user rather than by a test.
-    /// 3. Something else entirely — a truncated body, a file that was never a spreadsheet.
-    ///
-    /// Shapes 2 and 3 both decode to an empty workbook, matching the web editor's `file.sheets ?? []`
-    /// and its `catch { /* empty sheet, start fresh */ }`. The seeded array's tab *name* is read
-    /// when it is there, so a new file opens showing "Sheet1" rather than an unnamed tab.
-    ///
-    /// The seeded body is deliberately not converted cell-by-cell: `celldata` is always `[]` in the
-    /// constant, and writing a FortuneSheet importer for a format the app otherwise never sees
-    /// would be code with no second caller and no way to be sure it is right.
+    /// A body that is not a package at all decodes to an empty workbook rather than throwing. That
+    /// covers the one case that legitimately produces one: a spreadsheet created moments ago, whose
+    /// Drive row exists with no content because an `.xlsx` is a zip the server has no business
+    /// building. The editor opens it blank and its first save writes a real, sealed package.
     static func decode(from data: Data) -> SheetFile {
-        if let file = try? JSONDecoder().decode(SheetFile.self, from: data), !file.sheets.isEmpty {
-            return file
+        guard !data.isEmpty, let json = try? XlsxCodec.decodeToJSON(data),
+              let file = try? JSONDecoder().decode(SheetFile.self, from: json),
+              !file.sheets.isEmpty else {
+            return .empty
         }
-        if let seeded = decodeSeededDefault(from: data) {
-            return seeded
-        }
-        return .empty
+        return file
     }
 
-    /// Reads the tab names out of the server's seeded FortuneSheet array. Returns nil for anything
-    /// that is not that shape.
-    private static func decodeSeededDefault(from data: Data) -> SheetFile? {
-        guard let array = try? JSONDecoder().decode([JSONValue].self, from: data) else { return nil }
-        let names = array.compactMap { $0.objectValue?["name"]?.stringValue }
-        guard !names.isEmpty else { return .empty }
-        return SheetFile(sheets: names.map { SheetData(name: $0) })
-    }
-
-    /// Encodes the workbook as the web app writes it.
+    /// Encodes the workbook as the `.xlsx` bytes to store.
     ///
-    /// `.sortedKeys` is what makes a round trip byte-stable: `JSONEncoder` orders dictionary keys
-    /// arbitrarily otherwise, so the same workbook saved twice would produce two different blobs,
-    /// and the fixtures in `WorkbookCodecTests` could not assert anything.
-    func encoded() throws -> Data {
+    /// - Parameter previous: the package this one replaces. Its parts that neither implementation
+    ///   understands — pivot tables, images, charts another tool wrote — are carried into the
+    ///   result, so saving from a phone is not what strips a workbook that has been through Excel.
+    func encoded(keeping previous: Data? = nil) throws -> Data {
+        try XlsxCodec.encodeJSON(encodedJSON(), keeping: previous)
+    }
+
+    /// The `{"sheets":[…]}` envelope itself, which is what the codec speaks and what the round-trip
+    /// tests compare.
+    ///
+    /// `.sortedKeys` is what makes it byte-stable: `JSONEncoder` orders dictionary keys arbitrarily
+    /// otherwise, so the same workbook would encode two different ways.
+    func encodedJSON() throws -> Data {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         return try encoder.encode(self)

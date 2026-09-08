@@ -46,8 +46,15 @@ final class SheetContentServiceTests: XCTestCase {
         return Data("{\"encrypted_file_key\":\"\(key.sealed)\",\"key_version\":\(key.keyVersion)}".utf8)
     }
 
-    private func encrypted(_ text: String, with dek: Bytes) throws -> Data {
-        try service.encrypt(text: text, dek: dek, xcss: Sodium().secretStream.xchacha20poly1305)
+    /// A stored body: the workbook JSON as the `.xlsx` Drive holds, encrypted.
+    private func encrypted(_ workbookJSON: String, with dek: Bytes) throws -> Data {
+        try service.encrypt(data: Fixture.package(workbookJSON: workbookJSON), dek: dek,
+                            xcss: Sodium().secretStream.xchacha20poly1305)
+    }
+
+    /// Encrypts bytes verbatim, for the cases that are about the crypto rather than the workbook.
+    private func encryptedBytes(_ data: Data, with dek: Bytes) throws -> Data {
+        try service.encrypt(data: data, dek: dek, xcss: Sodium().secretStream.xchacha20poly1305)
     }
 
     private func infoJSON(id: String = "sheet-1",
@@ -64,24 +71,29 @@ final class SheetContentServiceTests: XCTestCase {
 
     // MARK: - Create (consequence 1)
 
-    /// "Create is one request, not two." The client supplies the id, the server seeds the body.
-    func testCreateIsASinglePostWithAClientSuppliedId() async throws {
+    /// Create, key, body. The client supplies the id; the body has to be written by the client
+    /// because an `.xlsx` is a zip the server has no business building.
+    func testCreateWritesTheRecordTheKeyAndAnEmptyWorkbook() async throws {
+        // `route` matches on `contains`, so the more specific paths have to come first: every URL
+        // here contains `/drive/files`.
         MockURLProtocol.route([
-            (suffix: "/drive/files", statusCode: 201, body: Data("""
-             {"id":"new-1","name":"Budget","folderId":null,"sizeBytes":103,
-              "mimeType":"\(SheetItem.sheetMIME)","updatedAt":"2026-08-10T12:00:00","contentVersion":1}
+            (suffix: "/autosave", statusCode: 200, body: Data("""
+             {"id":"new-1","name":"Budget.xlsx","folderId":null,"sizeBytes":420,
+              "mimeType":"\(SheetItem.sheetMIME)","updatedAt":"2026-08-10T12:00:01","contentVersion":2}
              """.utf8)),
             (suffix: "/key", statusCode: 200, body: Data(#"{"encrypted_file_key":"x"}"#.utf8)),
+            (suffix: "/drive/files", statusCode: 201, body: Data("""
+             {"id":"new-1","name":"Budget.xlsx","folderId":null,"sizeBytes":103,
+              "mimeType":"\(SheetItem.sheetMIME)","updatedAt":"2026-08-10T12:00:00","contentVersion":1}
+             """.utf8)),
         ])
 
         let item = try await service.createSpreadsheet(name: "Budget", parentID: nil)
 
         XCTAssertEqual(item.id, "new-1")
         XCTAssertEqual(item.mimeType, SheetItem.sheetMIME)
-        XCTAssertEqual(item.contentVersion, 1)
 
-        // Exactly two requests: the create, and the key. Not the Docs app's `/upload` two-step.
-        XCTAssertEqual(MockURLProtocol.requestCount, 2)
+        XCTAssertEqual(MockURLProtocol.requestCount, 3)
         let create = try XCTUnwrap(MockURLProtocol.requests.first)
         XCTAssertEqual(create.httpMethod, "POST")
         XCTAssertTrue(create.url?.path.hasSuffix("/drive/files") ?? false, create.url?.path ?? "")
@@ -92,18 +104,25 @@ final class SheetContentServiceTests: XCTestCase {
         // A client-supplied UUID, so the editor can open before the response lands.
         XCTAssertNotNil(UUID(uuidString: try XCTUnwrap(body["id"] as? String)))
         XCTAssertEqual(body["mimeType"] as? String, SheetItem.sheetMIME)
-        // `initialContent` is deliberately absent: the server seeds the default itself, and a
-        // client-written body here would be stored as plaintext.
+        // The extension is part of the file name, so a download opens on a double-click.
+        XCTAssertEqual(body["name"] as? String, "Budget.xlsx")
+        // `initialContent` is deliberately absent: the server would store it verbatim and
+        // unencrypted, so the body goes up through autosave instead.
         XCTAssertNil(body["initialContent"])
+
+        // And the file the create left empty is a real, sealed workbook by the time this returns.
+        XCTAssertEqual(item.contentVersion, 2)
+        XCTAssertTrue(MockURLProtocol.requests.last?.url?.path.hasSuffix("/autosave") ?? false)
     }
 
     // MARK: - Mime check (consequence 2)
 
     /// `/info` answers for any file type now, so "is this a spreadsheet?" is the client's job.
-    /// Nothing server-side stops this app opening a raw `.xlsx` and drawing an empty grid.
+    /// Nothing server-side stops this app opening a presentation and drawing an empty grid.
     func testOpeningANonSpreadsheetIsRefused() async {
+        let deck = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
         MockURLProtocol.route([
-            (suffix: "/info", statusCode: 200, body: infoJSON(mimeType: SheetItem.xlsxMIME)),
+            (suffix: "/info", statusCode: 200, body: infoJSON(mimeType: deck)),
         ])
 
         do {
@@ -113,7 +132,7 @@ final class SheetContentServiceTests: XCTestCase {
             guard case .notASpreadsheet(let mime) = error else {
                 return XCTFail("expected notASpreadsheet, got \(error)")
             }
-            XCTAssertEqual(mime, SheetItem.xlsxMIME)
+            XCTAssertEqual(mime, deck)
         } catch {
             XCTFail("unexpected error: \(error)")
         }
@@ -199,12 +218,10 @@ final class SheetContentServiceTests: XCTestCase {
         XCTAssertEqual(loaded.dek, dek)
     }
 
-    /// A brand-new spreadsheet holds the server's *plaintext* seed, because the body is written
-    /// before any client has a key for the file. Decryption failing is expected here, and the
-    /// bytes are the FortuneSheet default.
-    func testANewSpreadsheetsPlaintextSeedIsReadAndFlaggedForEncryption() async throws {
-        let seeded = #"[{"index":"0","name":"Sheet1","celldata":[],"row":100,"column":26}]"#
-
+    /// A spreadsheet whose body was never written — the window between `POST /drive/files` and the
+    /// first save — has no content and no key. Decryption failing is expected here, and the empty
+    /// body is an empty workbook rather than an error.
+    func testANewSpreadsheetsEmptyBodyIsReadAndFlaggedForEncryption() async throws {
         MockURLProtocol.handler = { request in
             let path = request.url?.path ?? ""
             let status = path.hasSuffix("/key") && request.httpMethod == "GET" ? 404 : 200
@@ -214,7 +231,7 @@ final class SheetContentServiceTests: XCTestCase {
             } else if path.hasSuffix("/key") {
                 body = Data(#"{"encrypted_file_key":"stored"}"#.utf8)
             } else {
-                body = Data(seeded.utf8)
+                body = Data()
             }
             return (HTTPURLResponse(url: request.url!, statusCode: status,
                                     httpVersion: nil, headerFields: nil)!, body)
@@ -224,7 +241,9 @@ final class SheetContentServiceTests: XCTestCase {
 
         XCTAssertTrue(loaded.needsInitialEncryption)
         XCTAssertEqual(loaded.file.sheets.count, 1)
-        XCTAssertEqual(loaded.file.sheets[0].name, "Sheet1")
+        XCTAssertTrue(loaded.file.sheets[0].cells.isEmpty)
+        // Nothing to carry forward, so a save writes a package from the model alone.
+        XCTAssertNil(loaded.sourcePackage)
 
         // A key was generated and stored, since the file had none.
         XCTAssertTrue(MockURLProtocol.requests.contains {
@@ -376,7 +395,7 @@ final class SheetContentServiceTests: XCTestCase {
         let dek = Sodium().secretStream.xchacha20poly1305.key()
         let workbook = #"{"sheets":[{"name":"Q3","cells":{}}]}"#
 
-        let ciphertext = try encrypted(workbook, with: dek)
+        let ciphertext = try encryptedBytes(Data(workbook.utf8), with: dek)
         XCTAssertNotEqual(ciphertext, Data(workbook.utf8))
         // The 24-byte secretstream header prefixes every ciphertext this app writes.
         XCTAssertGreaterThan(ciphertext.count, 24)
