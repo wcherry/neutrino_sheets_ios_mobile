@@ -4,6 +4,7 @@ import XCTest
 import NeutrinoCore
 import NeutrinoAuth
 import NeutrinoCrypto
+import NeutrinoOOXML
 @testable import NeutrinoSheets
 
 // MARK: - TestKeys
@@ -173,6 +174,14 @@ enum Fixture {
         SheetItem(id: id, name: name, type: .folder, parentID: parentID, size: nil,
                   modifiedAt: Date(timeIntervalSince1970: 1_700_000_000), isTrashed: false,
                   mimeType: nil, isStarred: isStarred)
+    }
+
+    /// A stored workbook body — the `.xlsx` bytes — for a `{"sheets":[…]}` fixture written as JSON.
+    ///
+    /// The tests state a workbook the way the model reads it, which is far more legible than a zip
+    /// literal; this is the one step between that and what Drive actually holds.
+    static func package(workbookJSON: String) throws -> Data {
+        try XlsxCodec.encodeJSON(Data(workbookJSON.utf8))
     }
 
     /// Drive's zone-less timestamp shape, as the file endpoints emit it.

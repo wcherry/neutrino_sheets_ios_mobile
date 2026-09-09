@@ -2,8 +2,9 @@ import XCTest
 import NeutrinoCore
 @testable import NeutrinoSheets
 
-/// Epic 4 — Drive integration. The listings all pass `?type=sheet`, which is the only thing keeping
-/// documents, slides and drawings out of a spreadsheet browser.
+/// Epic 4 — Drive integration. The listings all pass `?type=office` and then narrow to the
+/// spreadsheet MIME types, which together are what keep documents, slides and drawings out of a
+/// spreadsheet browser while still showing both formats a spreadsheet is stored in.
 @MainActor
 final class SheetsDriveServiceTests: XCTestCase {
 
@@ -39,11 +40,11 @@ final class SheetsDriveServiceTests: XCTestCase {
         // The root folder id is the user's own id, read from the token's `sub` claim.
         XCTAssertTrue(request?.url?.path.hasSuffix("/drive/folders/\(TestTokens.userId)") ?? false,
                       request?.url?.path ?? "")
-        XCTAssertTrue(request?.url?.query?.contains("type=sheet") ?? false,
+        XCTAssertTrue(request?.url?.query?.contains("type=office") ?? false,
                       request?.url?.query ?? "")
     }
 
-    func testEverySectionPassesTheSheetTypeFilter() async {
+    func testEverySectionPassesTheOfficeTypeFilter() async {
         for section in SheetsSection.allCases {
             MockURLProtocol.reset()
             MockURLProtocol.respond(json: String(decoding: Fixture.listing(), as: UTF8.self))
@@ -51,9 +52,71 @@ final class SheetsDriveServiceTests: XCTestCase {
             await service.load(section)
 
             let query = MockURLProtocol.requests.first?.url?.query ?? ""
-            XCTAssertTrue(query.contains("type=sheet"),
+            // `type=sheet` would be the obvious filter and is the bug: the server pins it to the
+            // bespoke JSON alone, so a drive of `.xlsx` spreadsheets lists as empty.
+            XCTAssertTrue(query.contains("type=office"),
                           "\(section.rawValue) did not filter by type: \(query)")
         }
+    }
+
+    /// The regression this exists for: a spreadsheet is a real `.xlsx`, and asking for `type=sheet`
+    /// returned none of them.
+    func testListingsShowXlsxSpreadsheets() async {
+        MockURLProtocol.respond(json: String(decoding: Fixture.listing(files: [
+            Fixture.fileJSON(id: "s1", name: "Budget.xlsx"),
+        ]), as: UTF8.self))
+
+        await service.load(.home)
+
+        XCTAssertEqual(service.allItems.map(\.id), ["s1"])
+        XCTAssertTrue(service.allItems[0].isNativeSheet)
+    }
+
+    /// `office` is coarser than the app needs — it also carries documents, decks and notes — so the
+    /// narrowing on the way in is load-bearing, not tidiness. The bespoke JSON is narrowed out with
+    /// everything else now that this app no longer reads it.
+    func testTheOfficeCategoryIsNarrowedToSpreadsheets() async {
+        MockURLProtocol.respond(json: String(decoding: Fixture.listing(files: [
+            Fixture.fileJSON(id: "s1"),
+            Fixture.fileJSON(id: "d1", mimeType: "application/x-neutrino-doc"),
+            Fixture.fileJSON(id: "p1", mimeType: "application/x-neutrino-slide"),
+            Fixture.fileJSON(id: "old", mimeType: "application/x-neutrino-sheet"),
+            Fixture.fileJSON(id: "csv", mimeType: "text/csv"),
+        ]), as: UTF8.self))
+
+        await service.load(.home)
+
+        XCTAssertEqual(service.allItems.map(\.id), ["s1"])
+    }
+
+    func testRecentIsNarrowedAfterTheServersWiderPage() async {
+        MockURLProtocol.respond(json: String(decoding: Fixture.listing(files: [
+            Fixture.fileJSON(id: "d1", mimeType: "application/x-neutrino-doc"),
+            Fixture.fileJSON(id: "s1"),
+        ]), as: UTF8.self))
+
+        await service.load(.recent)
+
+        XCTAssertEqual(service.recentItems.map(\.id), ["s1"])
+        // The page has to be wider than the section, since the server applies `type` — now the
+        // whole office category — before the limit.
+        let query = MockURLProtocol.requests.first?.url?.query ?? ""
+        XCTAssertTrue(query.contains("limit=500"), query)
+    }
+
+    func testTrashIsNarrowedToSpreadsheetsToo() async {
+        MockURLProtocol.respond(json: """
+        {"files":[
+          {"id":"s1","name":"Budget.xlsx","mimeType":"\(SheetItem.sheetMIME)","sizeBytes":128,
+           "deletedAt":"\(Fixture.driveTimestamp(Date(timeIntervalSince1970: 1_700_000_000)))"},
+          {"id":"d1","name":"Notes","mimeType":"application/x-neutrino-doc","sizeBytes":128,
+           "deletedAt":"\(Fixture.driveTimestamp(Date(timeIntervalSince1970: 1_700_000_000)))"}
+        ],"folders":[]}
+        """)
+
+        await service.load(.trash)
+
+        XCTAssertEqual(service.trashItems.map(\.id), ["s1"])
     }
 
     func testRecentPreservesTheServersOrdering() async {
@@ -130,6 +193,24 @@ final class SheetsDriveServiceTests: XCTestCase {
         XCTAssertTrue(item.isNativeSheet)
     }
 
+    /// `fetchItem` judges a file by what this app reads, not by the shared link vocabulary — which
+    /// stays deliberately more forgiving about formats for the sake of links minted by clients that
+    /// have not shipped this change.
+    func testFetchItemRejectsTheBespokeJSONFormat() async {
+        MockURLProtocol.respond(json: Fixture.fileJSON(mimeType: "application/x-neutrino-sheet"))
+
+        do {
+            _ = try await service.fetchItem(id: "old-1")
+            XCTFail("expected notFound")
+        } catch let error as SheetsDriveError {
+            guard case .notFound = error else {
+                return XCTFail("expected notFound, got \(error)")
+            }
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+
     // MARK: - Mutations
 
     func testRenameIsOptimisticAndRollsBackOnFailure() async {
@@ -138,8 +219,10 @@ final class SheetsDriveServiceTests: XCTestCase {
         MockURLProtocol.respond(json: "{}", statusCode: 500)
 
         service.rename(itemID: "s1", to: "Renamed")
-        // The local model changes first, so the row updates without waiting for the server.
-        XCTAssertEqual(service.item(id: "s1")?.name, "Renamed")
+        // The local model changes first, so the row updates without waiting for the server. The
+        // stored name carries the extension; `displayName` is what the user sees.
+        XCTAssertEqual(service.item(id: "s1")?.name, "Renamed.xlsx")
+        XCTAssertEqual(service.item(id: "s1")?.displayName, "Renamed")
 
         await settle()
         XCTAssertEqual(service.item(id: "s1")?.name, "Budget")
@@ -159,23 +242,27 @@ final class SheetsDriveServiceTests: XCTestCase {
         XCTAssertTrue(request?.url?.path.hasSuffix("/drive/files/s1") ?? false)
     }
 
-    /// Unlike Neutrino Docs, which appends `.md`, a spreadsheet is identified by its MIME type
-    /// alone. Adding an extension would show up as a stray suffix in every listing on the web.
-    func testSpreadsheetNamesGetNoExtension() async {
+    /// A spreadsheet *is* an `.xlsx`, so its Drive file has to be named `Budget.xlsx` — that is what
+    /// has to land on disk for a download to open on a double-click. Typing the extension twice must
+    /// not produce `Budget.xlsx.xlsx`.
+    func testSpreadsheetNamesCarryTheXlsxExtension() async {
+        // `route` matches on `contains`, so the more specific paths come first.
         MockURLProtocol.route([
-            (suffix: "/drive/files", statusCode: 201,
-             body: Data(Fixture.fileJSON(id: "new-1", name: "Budget").utf8)),
+            (suffix: "/autosave", statusCode: 200,
+             body: Data(Fixture.fileJSON(id: "new-1", name: "Budget.xlsx").utf8)),
             (suffix: "/key", statusCode: 200, body: Data(#"{"encrypted_file_key":"x"}"#.utf8)),
+            (suffix: "/drive/files", statusCode: 201,
+             body: Data(Fixture.fileJSON(id: "new-1", name: "Budget.xlsx").utf8)),
         ])
         TestKeys.install()
         defer { TestKeys.remove() }
 
         let content = SheetContentService(session: MockURLProtocol.makeSession())
         service.contentService = content
-        _ = try? await service.createSpreadsheet(name: "Budget", parentID: nil)
+        _ = try? await service.createSpreadsheet(name: "Budget.xlsx", parentID: nil)
 
         let body = try? JSONSerialization.jsonObject(with: MockURLProtocol.bodies[0]) as? [String: Any]
-        XCTAssertEqual(body?["name"] as? String, "Budget")
+        XCTAssertEqual(body?["name"] as? String, "Budget.xlsx")
     }
 
     func testStarringUpdatesFavoritesWithoutARefetch() async {

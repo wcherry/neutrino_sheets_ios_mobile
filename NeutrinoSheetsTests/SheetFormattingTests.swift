@@ -39,7 +39,7 @@ final class SheetFormattingTests: XCTestCase {
     private func load(_ workbook: String, role: String = "owner") async throws {
         let dek = Sodium().secretStream.xchacha20poly1305.key()
         let sealed = try service.sealDEK(dek)
-        let ciphertext = try service.encrypt(text: workbook, dek: dek,
+        let ciphertext = try service.encrypt(data: Fixture.package(workbookJSON: workbook), dek: dek,
                                              xcss: Sodium().secretStream.xchacha20poly1305)
         MockURLProtocol.handler = { request in
             let path = request.url?.path ?? ""
@@ -54,7 +54,11 @@ final class SheetFormattingTests: XCTestCase {
                  "yourRole":"\(role)","contentVersion":4}
                 """.utf8))
             }
-            if path.hasSuffix("/key") { return ok(Data("{\"encrypted_file_key\":\"\(sealed)\"}".utf8)) }
+            if path.hasSuffix("/key") {
+                return ok(Data("""
+                {"encrypted_file_key":"\(sealed.sealed)","key_version":\(sealed.keyVersion)}
+                """.utf8))
+            }
             return ok(ciphertext)
         }
         await model.load()

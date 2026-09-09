@@ -58,14 +58,12 @@ struct SheetFileInfo: Decodable, Hashable {
     /// True when the file is still somewhere an edit can land.
     var isLive: Bool { deletedAt == nil }
 
-    /// True when this file is a native Neutrino spreadsheet.
+    /// True when this file is a Neutrino spreadsheet — a real `.xlsx`.
     ///
-    /// The web client synthesises its own 404 when this is false, and that is load-bearing rather
-    /// than incidental: office mode (Epic 23) keys off exactly that signal to decide it must parse
-    /// the file as `.xlsx`. Phase 1 has no office mode, so a false here is reported to the user as
-    /// "this isn't a spreadsheet this app can open" — but the *check* lives here from the start, so
-    /// Epic 23 has a hook rather than a rewrite.
-    var isNativeSheet: Bool { mimeType == SheetItem.sheetMIME }
+    /// `/info` answers for every file type since the drive refactor, so nothing server-side will
+    /// stop this app opening a presentation and rendering an empty grid. This is the check that
+    /// does.
+    var isNativeSheet: Bool { SheetItem.isSpreadsheet(mimeType) }
 
     /// Whether this account may write to the workbook.
     var isEditable: Bool { yourRole.canEdit }

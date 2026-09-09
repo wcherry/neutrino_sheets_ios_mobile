@@ -2,6 +2,7 @@ import Foundation
 import os.log
 import NeutrinoCore
 import NeutrinoAuth
+import NeutrinoOOXML
 
 // MARK: - SheetsDriveError
 
@@ -29,10 +30,22 @@ enum SheetsDriveError: LocalizedError {
 
 /// Browses and organises the spreadsheets stored in Neutrino Drive.
 ///
-/// Reuses Drive's existing folder / file / trash APIs — Sheets has no backend of its own. Every
-/// listing passes `type=sheet`, so the server returns only files whose MIME type is
-/// `application/x-neutrino-sheet`; folders come back unfiltered because a folder may hold
-/// spreadsheets whatever else is in it.
+/// Reuses Drive's existing folder / file / trash APIs — Sheets has no backend of its own. Folders
+/// come back unfiltered because a folder may hold spreadsheets whatever else is in it.
+///
+/// ## Why the listings do not ask for `type=sheet`
+///
+/// A spreadsheet is a real `.xlsx` (issue #127). The server's `type=sheet` filter matches the
+/// bespoke `application/x-neutrino-sheet` JSON that predates it and nothing else — it is pinned to
+/// that meaning for the benefit of clients that shipped before the change — so asking for it lists
+/// a drive as completely empty.
+///
+/// The folder listings take no `mimeType=` parameter (only the flat `GET /drive/files` does, which
+/// is what the web library uses), so every listing here asks for the coarser
+/// ``spreadsheetTypeFilter`` — the category the server guarantees an `.xlsx` lands in — and narrows
+/// the result to `SheetItem.spreadsheetMIMEs` on the way in. The narrowing has to happen for
+/// correctness, not tidiness: `office` also carries documents, decks, notes and uploaded Office
+/// files.
 ///
 /// There is no whole-drive `type=` listing — `type` always scopes to one folder (or the `/starred`,
 /// `/recent`, `/trash`, `/shared-with-me` views, which support it directly). A user's root folder
@@ -82,9 +95,43 @@ final class SheetsDriveService: ObservableObject {
 
     private var baseURL: String { AuthService.baseURL }
 
-    /// The `type=` filter value that selects native spreadsheets server-side
-    /// (`DriveFileType::Sheet` -> `application/x-neutrino-sheet`).
-    private static let typeFilter = "sheet"
+    /// The `type=` value every spreadsheet listing sends.
+    ///
+    /// Drive's `office` category is the narrowest filter the server has that provably holds an
+    /// `.xlsx` — the backend pins that in `office_gathers_the_suite_and_its_uploaded_equivalents`
+    /// and `code_gives_up_what_an_earlier_category_claimed` (`src/drive/filesystem/dto.rs`), and the
+    /// web app's `categorizeMime` agrees. It still has to be narrowed client-side, because it also
+    /// carries documents, decks, notes and uploaded Office files.
+    ///
+    /// Sending *no* filter would be simpler and is wrong: the listing is limited and sorted in SQL
+    /// before anything is filtered, so in a drive holding a few thousand photos an unfiltered page
+    /// is all photos and no spreadsheets.
+    private static let spreadsheetTypeFilter = "office"
+
+    /// How many rows a spreadsheet listing asks the server for.
+    ///
+    /// Higher than the number of spreadsheets meant to come back, because the page is now cut from
+    /// the whole office category rather than from spreadsheets alone.
+    private static let listingPageSize = 500
+
+    /// How many spreadsheets the Recent section shows, applied after narrowing.
+    private static let recentLimit = 50
+
+    /// The path that lists one folder's spreadsheets; `nil` is the drive root, whose folder id is
+    /// the signed-in user's own id.
+    ///
+    /// Only the root listing is paged and sorted. A subfolder is asked for whole — the server reads
+    /// an absent `limit` as "no limit" — because a page cut before the office category is narrowed
+    /// to spreadsheets is a page that can come back empty while the folder holds spreadsheets
+    /// further down it.
+    private func folderListingPath(_ folderID: String?) throws -> String {
+        if let folderID {
+            return "/api/v1/drive/folders/\(folderID)?type=\(Self.spreadsheetTypeFilter)"
+        }
+        guard let rootId = currentUserId() else { throw SheetsDriveError.notAuthenticated }
+        return "/api/v1/drive/folders/\(rootId)?limit=\(Self.listingPageSize)&offset=0"
+            + "&orderBy=createdAt&direction=desc&type=\(Self.spreadsheetTypeFilter)"
+    }
 
     private static let decoder: JSONDecoder = {
         let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "NeutrinoSheets",
@@ -164,12 +211,13 @@ final class SheetsDriveService: ObservableObject {
     /// the user is browsing. A Universal Link is not: it names a file that may sit in a folder
     /// nobody has opened, or one shared by another account, so there is no listing to read it out of.
     ///
-    /// Throws ``SheetsDriveError/notFound`` for a file that is not a native spreadsheet — the app
-    /// link vocabulary is per-app, so an `/open/sheet/…` link pointing at a document is a malformed
-    /// link rather than something to render badly.
+    /// Throws ``SheetsDriveError/notFound`` for a file that is not a spreadsheet in either of its
+    /// formats — the app link vocabulary is per-app, so an `/open/sheet/…` link pointing at a
+    /// document is a malformed link rather than something to render badly. An `.xlsx` *is* a
+    /// spreadsheet and resolves here; the editor is what tells the user it cannot open one yet.
     func fetchItem(id: String) async throws -> SheetItem {
         let file: APIFileResponse = try await get("/api/v1/drive/files/\(id)/metadata")
-        guard file.mimeType == SheetItem.sheetMIME else {
+        guard SheetItem.isSpreadsheet(file.mimeType) else {
             logger.error("fetchItem: \(id, privacy: .public) is \(file.mimeType, privacy: .public), not a spreadsheet")
             throw SheetsDriveError.notFound
         }
@@ -188,45 +236,42 @@ final class SheetsDriveService: ObservableObject {
         do {
             switch section {
             case .home:
-                let response: APIFolderContentsResponse
-                if let parentID {
-                    response = try await get("/api/v1/drive/folders/\(parentID)?type=\(Self.typeFilter)")
-                } else {
-                    guard let rootId = currentUserId() else { throw SheetsDriveError.notAuthenticated }
-                    response = try await get(
-                        "/api/v1/drive/folders/\(rootId)?limit=200&offset=0&orderBy=createdAt&direction=desc&type=\(Self.typeFilter)")
-                }
+                let response: APIFolderContentsResponse = try await get(folderListingPath(parentID))
                 let folders = response.folders.map { SheetItem(folder: $0) }
-                let files = response.files.map { SheetItem(file: $0) }
+                let files = response.spreadsheets.map { SheetItem(file: $0) }
                 // Replace this parent's cached items so a refresh cannot duplicate rows.
                 allItems.removeAll { $0.parentID == parentID }
                 allItems.append(contentsOf: folders)
                 allItems.append(contentsOf: files)
 
             case .recent:
-                // `limit` counts spreadsheets, not files of every type, because the server applies
-                // `type` before the limit.
-                let response: APIFolderContentsResponse =
-                    try await get("/api/v1/drive/recent?type=\(Self.typeFilter)&limit=50")
-                recentItems = response.files.map { SheetItem(file: $0) }
+                // `limit` counts office files rather than spreadsheets — the server applies `type`
+                // before the limit, and `type` is now the coarser category — so ask for a page wide
+                // enough that the spreadsheets in it still fill the section after narrowing.
+                let response: APIFolderContentsResponse = try await get(
+                    "/api/v1/drive/recent?type=\(Self.spreadsheetTypeFilter)&limit=\(Self.listingPageSize)")
+                recentItems = response.spreadsheets.prefix(Self.recentLimit).map { SheetItem(file: $0) }
 
             case .favorites:
-                let response: APIFolderContentsResponse =
-                    try await get("/api/v1/drive/starred?type=\(Self.typeFilter)")
+                // `limit` is not optional here in practice: `/starred` backs the web's quick-access
+                // row, so it defaults to *five* items. Five office files can easily be five
+                // documents, leaving Favorites empty with the spreadsheets one row further down.
+                let response: APIFolderContentsResponse = try await get(
+                    "/api/v1/drive/starred?type=\(Self.spreadsheetTypeFilter)&limit=\(Self.listingPageSize)")
                 starredItems = response.folders.map { SheetItem(folder: $0) }
-                    + response.files.map { SheetItem(file: $0) }
+                    + response.spreadsheets.map { SheetItem(file: $0) }
 
             case .shared:
-                let response: APISharedWithMeResponse =
-                    try await get("/api/v1/drive/shared-with-me?type=\(Self.typeFilter)")
+                let response: APISharedWithMeResponse = try await get(
+                    "/api/v1/drive/shared-with-me?type=\(Self.spreadsheetTypeFilter)")
                 sharedItems = response.folders.map { SheetItem(sharedFolder: $0) }
-                    + response.files.map { SheetItem(sharedFile: $0) }
+                    + response.spreadsheets.map { SheetItem(sharedFile: $0) }
 
             case .trash:
-                let response: APITrashContentsResponse =
-                    try await get("/api/v1/drive/trash?type=\(Self.typeFilter)")
+                let response: APITrashContentsResponse = try await get(
+                    "/api/v1/drive/trash?type=\(Self.spreadsheetTypeFilter)")
                 trashItems = response.folders.map { SheetItem(trashFolder: $0) }
-                    + response.files.map { SheetItem(trashFile: $0) }
+                    + response.spreadsheets.map { SheetItem(trashFile: $0) }
             }
             logger.debug("load \(section.rawValue, privacy: .public) succeeded")
         } catch {
@@ -280,9 +325,13 @@ final class SheetsDriveService: ObservableObject {
     /// The whole decoded workbook is copied, including the charts and conditional formats this app
     /// cannot render — they ride along in `unknownFields`, so a duplicate made on a phone is not a
     /// lossy copy.
+    ///
+    /// Refuses anything that is not a spreadsheet, since the round trip goes through this app's
+    /// codec: a presentation copied this way would come back as a workbook under a `.pptx` name,
+    /// readable by nothing.
     @discardableResult
     func duplicate(itemID: String) async throws -> SheetItem {
-        guard let source = item(id: itemID), source.type == .file else {
+        guard let source = item(id: itemID), source.isNativeSheet else {
             throw SheetsDriveError.notFound
         }
         guard let contentService else { throw SheetsDriveError.notFound }
@@ -611,14 +660,16 @@ final class SheetsDriveService: ObservableObject {
         return claims.sub
     }
 
-    /// Spreadsheets are stored under their plain name.
+    /// The Drive file name for a spreadsheet titled `name`.
     ///
-    /// Unlike Neutrino Docs, which appends `.md` so Drive recognises the file, a spreadsheet is
-    /// identified by its MIME type alone — the extension carries nothing, and adding one would
-    /// only show up as a stray `.sheet` in every listing on the web.
+    /// A spreadsheet *is* an `.xlsx`, and the extension is part of the file name because a download
+    /// has to land on disk as `Budget.xlsx` to open on a double-click. The user never types it and
+    /// never sees it — ``SheetItem/displayName`` takes it back off — so it is added here, once,
+    /// wherever a name reaches Drive.
     private func normalizedName(_ name: String) -> String {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? "Untitled spreadsheet" : trimmed
+        let trimmed = XlsxCodec.strippingExtension(
+            name.trimmingCharacters(in: .whitespacesAndNewlines))
+        return XlsxCodec.withExtension(trimmed.isEmpty ? "Untitled spreadsheet" : trimmed)
     }
 
     // MARK: - HTTP
@@ -763,6 +814,9 @@ private extension SheetItem {
 private struct APIFolderContentsResponse: Decodable {
     let files: [APIFileResponse]
     let folders: [APIFolderResponse]
+
+    /// The Neutrino spreadsheets among the office files the server sent back.
+    var spreadsheets: [APIFileResponse] { files.filter { SheetItem.isSpreadsheet($0.mimeType) } }
 }
 
 /// The subset of a JWT's claims `currentUserId()` needs.
@@ -775,6 +829,8 @@ private struct JWTClaims: Decodable {
 private struct APISharedWithMeResponse: Decodable {
     let files: [APIFileResponse]
     let folders: [APIFolderResponse]
+
+    var spreadsheets: [APIFileResponse] { files.filter { SheetItem.isSpreadsheet($0.mimeType) } }
 }
 
 private struct APIFolderResponse: Decodable {
@@ -801,6 +857,8 @@ private struct APIFileResponse: Decodable {
 private struct APITrashContentsResponse: Decodable {
     let files: [APITrashFileItem]
     let folders: [APITrashFolderItem]
+
+    var spreadsheets: [APITrashFileItem] { files.filter { SheetItem.isSpreadsheet($0.mimeType) } }
 }
 
 private struct APITrashFileItem: Decodable {

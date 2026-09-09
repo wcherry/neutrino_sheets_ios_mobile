@@ -25,6 +25,7 @@ struct NeutrinoSheetsApp: App {
     @StateObject private var settings: AppSettings
     @StateObject private var biometricService: BiometricAuthService
     @StateObject private var deviceSessionService: DeviceSessionService
+    @StateObject private var keyProvisioningService: KeyProvisioningService
     @StateObject private var driveService: SheetsDriveService
     @StateObject private var contentService: SheetContentService
     @StateObject private var networkMonitor: NetworkMonitor
@@ -46,6 +47,7 @@ struct NeutrinoSheetsApp: App {
             isFeatureEnabled: FeatureFlags.biometricLock
         ))
         _deviceSessionService = StateObject(wrappedValue: DeviceSessionService())
+        _keyProvisioningService = StateObject(wrappedValue: KeyProvisioningService())
         _driveService = StateObject(wrappedValue: SheetsDriveService())
         _contentService = StateObject(wrappedValue: SheetContentService())
         _networkMonitor = StateObject(wrappedValue: NetworkMonitor())
@@ -61,6 +63,7 @@ struct NeutrinoSheetsApp: App {
                 .environmentObject(settings)
                 .environmentObject(biometricService)
                 .environmentObject(deviceSessionService)
+                .environmentObject(keyProvisioningService)
                 .environmentObject(driveService)
                 .environmentObject(contentService)
                 .environmentObject(networkMonitor)
@@ -101,6 +104,10 @@ struct NeutrinoSheetsApp: App {
         if authService.isAuthenticated && KeyImportService.hasStoredKeys() {
             Task { try? await KeyFileService.shared.restoreArchivedKeys() }
         }
+
+        // Minting a key and restoring one from a printed kit both talk to the account's key
+        // directory, so this needs the same token refresher as everything else.
+        keyProvisioningService.authService = authService
 
         if authService.isAuthenticated {
             await authService.refreshTokenIfNeeded()

@@ -35,11 +35,17 @@ targets:
         product: NeutrinoCrypto
       - package: NeutrinoShared
         product: NeutrinoUI
+      # Zip and XML plumbing only — `ZipArchive` and `XMLElement`, Foundation + Compression, no
+      # dependency on anything else in the package. Reading and writing the `.xlsx` itself is
+      # `Workbook/OOXML/` in this repo: the mapping is Sheets-shaped, so it does not belong in a
+      # package the other five apps rebuild against.
+      - package: NeutrinoShared
+        product: NeutrinoOOXML
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.neutrino.sheets
         MARKETING_VERSION: "1.0.0"
-        CURRENT_PROJECT_VERSION: "4"
+        CURRENT_PROJECT_VERSION: "8"
         SWIFT_VERSION: "5.0"
         IPHONEOS_DEPLOYMENT_TARGET: "16.0"
         DEVELOPMENT_TEAM: "46KWJJ63FU"

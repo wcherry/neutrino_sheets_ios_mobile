@@ -60,7 +60,13 @@ The API this app talks to
 and dropped the `sheets` marker table. Every per-app editor service — docs, sheets, slides, drawing,
 diagrams — collapsed into one set of generic Drive endpoints driven by a mime-type registry
 (`src/drive/storage/native_types.rs`). **Membership in that registry is the marker**: a file is a
-spreadsheet because its mime type is `application/x-neutrino-sheet`, not because a side table says so.
+spreadsheet because of its mime type, not because a side table says so.
+
+Since issue #127 that mime type is
+`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` — a spreadsheet is a real
+`.xlsx`, named `Budget.xlsx` in Drive, read and written here through `NeutrinoOOXML`. The bespoke
+`application/x-neutrino-sheet` JSON that predates it is no longer a format this app reads, writes,
+lists or routes; see `agent_docs/plans/native-xlsx-spreadsheets.md`.
 
 This is good news for this app. The Neutrino Docs iOS client already calls *only* generic Drive
 endpoints — it never had a per-app resource — so the server has moved toward what the reference iOS
@@ -70,7 +76,7 @@ Spreadsheet CRUD — all generic Drive:
 
 | Operation | Endpoint |
 | --- | --- |
-| List | `GET /api/v1/drive/files?mimeType=application/x-neutrino-sheet&limit=200` |
+| List | `GET /api/v1/drive/folders/{id}?type=office&limit=500`, narrowed client-side to the spreadsheet mime type. `type=sheet` is pinned to the bespoke JSON and matches nothing; the folder listings take no `mimeType=` parameter |
 | Create | `POST /api/v1/drive/files` — `{id, name, mimeType, folderId, initialContent?}` |
 | Open (metadata) | `GET /api/v1/drive/files/{id}/info` — name, `yourRole`, `contentVersion`, `mimeType` |
 | Read content | `GET /api/v1/drive/files/{id}` |
@@ -606,15 +612,20 @@ Phase 6 — Import, Export & Interop
 * ⬜ XLSX as a new sheet or a new tab
 * ⬜ Open from Files / share-sheet inbound
 
-⬜ Epic 23 — Office Mode
+✅ Epic 23 — Office Mode
 
-* ⬜ Open a raw `.xlsx` from Drive and edit it in place, keeping the bytes valid OOXML at rest
-* ⬜ "Convert to Neutrino Sheet" via `POST /api/v1/drive/files/{id}/convert` with
-  `{targetMimeType: "application/x-neutrino-sheet", content}` — this replaced the per-app promote
-  endpoint. The server validates the conversion against `native_types::can_convert`, so only a real
-  `.xlsx` is accepted, and the file keeps its id
-* ⚠️ There is no SheetJS on iOS. This epic needs a Swift XLSX reader/writer (or a vendored C
-  library) and is the reason it sits this late — it is a dependency decision, not a UI one
+Delivered ahead of its place in this list, because it stopped being an enhancement: every
+spreadsheet any client creates has been an `.xlsx` since issue #127, so an app that could not open
+one could not open anything. See `agent_docs/plans/native-xlsx-spreadsheets.md`.
+
+* ✅ Open a raw `.xlsx` from Drive and edit it in place, keeping the bytes valid OOXML at rest — an
+  `.xlsx` is now the *only* format this app reads and writes
+* ✅ The Swift XLSX reader/writer this needed: `NeutrinoOOXML/Xlsx/` in `neutrino_shared_ios`, on
+  top of the zip and XML layers Docs added for `.docx`. No third-party dependency and no vendored C
+  library — the module is Foundation plus Compression, as its package manifest anticipated
+* ⬜ "Convert to Neutrino Sheet" via `POST /api/v1/drive/files/{id}/convert` — moot for a file
+  created by Neutrino, which is already an `.xlsx`. Still the route for a foreign upload if one is
+  ever wanted under a different mime type
 
 ⬜ Epic 24 — Templates
 

@@ -1,9 +1,22 @@
 import XCTest
+import NeutrinoOOXML
 @testable import NeutrinoSheets
 
 /// Epic 5 — the workbook codec. The format is the contract with the web app, so these are the tests
 /// that stop a mobile save destroying work done in a browser.
+///
+/// Two layers, and both matter. Most of what follows is about the `{"sheets":[…]}` *envelope* — the
+/// model the editors share — which is why those tests speak JSON directly. What Drive stores is the
+/// `.xlsx` that envelope is carried in; "The stored format" below is where the two meet.
 final class WorkbookCodecTests: XCTestCase {
+
+    // MARK: - Helpers
+
+    /// The envelope, decoded as the codec hands it over. `SheetFile.decode(from:)` takes package
+    /// bytes now, so a test about the JSON says so.
+    private func decodeJSON(_ json: String) throws -> SheetFile {
+        try JSONDecoder().decode(SheetFile.self, from: Data(json.utf8))
+    }
 
     // MARK: - Fixtures
 
@@ -51,7 +64,7 @@ final class WorkbookCodecTests: XCTestCase {
     // MARK: - Decoding
 
     func testDecodesTheWebAppsWorkbookShape() throws {
-        let file = SheetFile.decode(from: Data(webWorkbookJSON.utf8))
+        let file = try decodeJSON(webWorkbookJSON)
 
         XCTAssertEqual(file.sheets.count, 2)
         XCTAssertEqual(file.sheets[0].name, "Q3")
@@ -72,7 +85,7 @@ final class WorkbookCodecTests: XCTestCase {
     }
 
     func testDecodesMergeSpansAndAnchors() throws {
-        let file = SheetFile.decode(from: Data(webWorkbookJSON.utf8))
+        let file = try decodeJSON(webWorkbookJSON)
         let cells = file.sheets[0].cells
 
         XCTAssertEqual(cells["C1"]?.colSpan, 2)
@@ -83,7 +96,7 @@ final class WorkbookCodecTests: XCTestCase {
     }
 
     func testColumnWidthsAreKeyedByZeroBasedIndex() throws {
-        let file = SheetFile.decode(from: Data(webWorkbookJSON.utf8))
+        let file = try decodeJSON(webWorkbookJSON)
         let sheet = file.sheets[0]
 
         // Column index 0 is column A, which is `CellAddress(column: 1, ...)`. Mixing the two
@@ -99,12 +112,12 @@ final class WorkbookCodecTests: XCTestCase {
     /// The single most destructive thing this app could do: open a workbook made on the web, save
     /// it, and silently drop the charts.
     func testPreservesFieldsTheAppCannotRender() throws {
-        var file = SheetFile.decode(from: Data(webWorkbookJSON.utf8))
+        var file = try decodeJSON(webWorkbookJSON)
 
         // Make an edit, exactly as the editor would.
         file.sheets[0].cells["A2"] = SavedCell(id: "A2", raw: "Costs", value: "Costs")
 
-        let reencoded = try file.encoded()
+        let reencoded = try file.encodedJSON()
         let object = try XCTUnwrap(
             JSONSerialization.jsonObject(with: reencoded) as? [String: Any]
         )
@@ -133,7 +146,7 @@ final class WorkbookCodecTests: XCTestCase {
     /// to be carried is the one migration `UnknownFields` is built to survive, and this is what
     /// says it did: the fixture's region comes back typed, with its bounds intact.
     func testDecodesTableRegionsAsTypedValues() throws {
-        let file = SheetFile.decode(from: Data(webWorkbookJSON.utf8))
+        let file = try decodeJSON(webWorkbookJSON)
         let region = try XCTUnwrap(file.sheets[0].tables?.first)
 
         XCTAssertEqual(region.id, "t-1")
@@ -143,9 +156,9 @@ final class WorkbookCodecTests: XCTestCase {
     }
 
     func testTableRegionsSurviveAReEncode() throws {
-        let file = SheetFile.decode(from: Data(webWorkbookJSON.utf8))
+        let file = try decodeJSON(webWorkbookJSON)
         let object = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: try file.encoded()) as? [String: Any]
+            JSONSerialization.jsonObject(with: try file.encodedJSON()) as? [String: Any]
         )
         let sheets = try XCTUnwrap(object["sheets"] as? [[String: Any]])
         let tables = try XCTUnwrap(sheets[0]["tables"] as? [[String: Any]])
@@ -164,11 +177,11 @@ final class WorkbookCodecTests: XCTestCase {
           {"id":"t-1","styleId":"blue-banded","minR":1,"maxR":4,"minC":1,"maxC":2,
            "headerLabels":["Item","Cost"]}]}]}
         """#
-        let file = SheetFile.decode(from: Data(json.utf8))
+        let file = try decodeJSON(json)
         XCTAssertEqual(file.sheets[0].tables?.first?.styleId, "blue-banded")
 
         let object = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: try file.encoded()) as? [String: Any]
+            JSONSerialization.jsonObject(with: try file.encodedJSON()) as? [String: Any]
         )
         let sheets = try XCTUnwrap(object["sheets"] as? [[String: Any]])
         let tables = try XCTUnwrap(sheets[0]["tables"] as? [[String: Any]])
@@ -180,11 +193,11 @@ final class WorkbookCodecTests: XCTestCase {
     /// the next time the web app tried to re-band it.
     func testAnUnreadableTablesValueIsStillWrittenBack() throws {
         let json = #"{"sheets":[{"cells":{},"tables":{"legacy":"shape"}}]}"#
-        let file = SheetFile.decode(from: Data(json.utf8))
+        let file = try decodeJSON(json)
         XCTAssertNil(file.sheets[0].tables)
 
         let object = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: try file.encoded()) as? [String: Any]
+            JSONSerialization.jsonObject(with: try file.encodedJSON()) as? [String: Any]
         )
         let sheets = try XCTUnwrap(object["sheets"] as? [[String: Any]])
         let tables = try XCTUnwrap(sheets[0]["tables"] as? [String: Any])
@@ -193,17 +206,17 @@ final class WorkbookCodecTests: XCTestCase {
 
     func testDoesNotEmitAnEmptyTablesArray() throws {
         let file = SheetFile(sheets: [SheetData(name: "Sheet1", tables: [])])
-        let text = String(decoding: try file.encoded(), as: UTF8.self)
+        let text = String(decoding: try file.encodedJSON(), as: UTF8.self)
 
         XCTAssertFalse(text.contains("tables"), text)
     }
 
     func testPreservesUnknownTopLevelKeys() throws {
         let json = #"{"sheets":[{"cells":{}}],"schemaVersion":3,"lastEditor":"web"}"#
-        let file = SheetFile.decode(from: Data(json.utf8))
+        let file = try decodeJSON(json)
 
         let object = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: try file.encoded()) as? [String: Any]
+            JSONSerialization.jsonObject(with: try file.encodedJSON()) as? [String: Any]
         )
         XCTAssertEqual(object["schemaVersion"] as? Int, 3)
         XCTAssertEqual(object["lastEditor"] as? String, "web")
@@ -213,8 +226,8 @@ final class WorkbookCodecTests: XCTestCase {
     /// mobile save a diff against the same workbook saved on the web.
     func testWholeNumbersRoundTripAsIntegers() throws {
         let json = #"{"sheets":[{"cells":{},"charts":[{"width":400,"ratio":1.5}]}]}"#
-        let file = SheetFile.decode(from: Data(json.utf8))
-        let text = String(decoding: try file.encoded(), as: UTF8.self)
+        let file = try decodeJSON(json)
+        let text = String(decoding: try file.encodedJSON(), as: UTF8.self)
 
         XCTAssertTrue(text.contains("\"width\":400"), text)
         XCTAssertFalse(text.contains("400.0"), text)
@@ -226,19 +239,50 @@ final class WorkbookCodecTests: XCTestCase {
     /// Epic 5 — "Round-trip fixtures … asserted byte-stable". Decode, encode, decode, encode: the
     /// two encodings must be identical, or nothing else here can assert anything.
     func testRoundTripIsByteStable() throws {
-        let first = SheetFile.decode(from: Data(webWorkbookJSON.utf8))
-        let firstBytes = try first.encoded()
-        let second = SheetFile.decode(from: firstBytes)
-        let secondBytes = try second.encoded()
+        let first = try decodeJSON(webWorkbookJSON)
+        let firstBytes = try first.encodedJSON()
+        let second = try JSONDecoder().decode(SheetFile.self, from: firstBytes)
+        let secondBytes = try second.encodedJSON()
 
         XCTAssertEqual(firstBytes, secondBytes)
+    }
+
+    // MARK: - The stored format
+
+    /// What Drive actually holds is an `.xlsx`, and the model has to survive the trip through it —
+    /// including the charts this app cannot render, which ride in the package's extras part.
+    func testTheStoredFormatIsAnXlsxTheModelSurvives() throws {
+        var file = try decodeJSON(webWorkbookJSON)
+        file.sheets[0].cells["A2"] = SavedCell(id: "A2", raw: "Costs", value: "Costs")
+
+        let package = try file.encoded()
+        XCTAssertTrue(XlsxCodec.isWorkbook(package))
+
+        let back = SheetFile.decode(from: package)
+        XCTAssertEqual(back.sheets.count, file.sheets.count)
+        XCTAssertEqual(back.sheets[0].cells["A2"]?.raw, "Costs")
+        XCTAssertEqual(back.sheets[0].name, file.sheets[0].name)
+
+        // The charts came back, which is the whole point of carrying the extras part.
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try back.encodedJSON()) as? [String: Any])
+        let sheets = try XCTUnwrap(object["sheets"] as? [[String: Any]])
+        let charts = try XCTUnwrap(sheets[0]["charts"] as? [[String: Any]])
+        XCTAssertEqual(charts.first?["id"] as? String, "chart-1")
+    }
+
+    /// The offline path and the save path both compare stored bytes to decide whether anything
+    /// changed, so two encodings of one workbook have to be identical.
+    func testTheStoredPackageIsByteStable() throws {
+        let file = try decodeJSON(webWorkbookJSON)
+        XCTAssertEqual(try file.encoded(), try file.encoded())
     }
 
     func testDoesNotEmitEmptyOptionalContainers() throws {
         // The web app omits `colWidths` entirely when there are no overrides. Emitting `{}` would
         // differ from what a browser writes for the same workbook.
         let file = SheetFile(sheets: [SheetData(name: "Sheet1", cells: [:], colWidths: [:])])
-        let text = String(decoding: try file.encoded(), as: UTF8.self)
+        let text = String(decoding: try file.encodedJSON(), as: UTF8.self)
 
         XCTAssertFalse(text.contains("colWidths"), text)
         XCTAssertFalse(text.contains("rowHeights"), text)
@@ -247,25 +291,23 @@ final class WorkbookCodecTests: XCTestCase {
 
     // MARK: - Lenient decode (Risk 4)
 
-    /// Every brand-new spreadsheet holds this, because `POST /drive/files` seeds
-    /// `native_types::EMPTY_SHEET_CONTENT` — a FortuneSheet-shaped *array*, not `{"sheets":[…]}`.
-    /// A strict decoder would fail to open every spreadsheet the moment it was created.
-    func testDecodesTheServersSeededDefaultBody() throws {
-        let seeded = #"[{"index":"0","name":"Sheet1","celldata":[],"row":100,"column":26,"order":0,"status":1,"config":{}}]"#
-
-        let file = SheetFile.decode(from: Data(seeded.utf8))
-
+    /// A spreadsheet created moments ago has no content at all: an `.xlsx` is a zip the server has
+    /// no business building, so `POST /drive/files` writes nothing and the client's first save is
+    /// what makes the file a real workbook. Opening it in between must show a blank grid, not fail.
+    func testAnEmptyBodyDecodesAsAnEmptyWorkbook() {
+        let file = SheetFile.decode(from: Data())
         XCTAssertEqual(file.sheets.count, 1)
-        XCTAssertEqual(file.sheets[0].name, "Sheet1")
         XCTAssertTrue(file.sheets[0].cells.isEmpty)
     }
 
-    func testDecodesUnrecognisedBodiesAsAnEmptyWorkbook() throws {
-        // Matches the web editor's `catch { /* empty sheet, start fresh */ }`.
-        for body in ["", "not json at all", "{}", "null", #"{"sheets":[]}"#] {
+    func testDecodesUnrecognisedBodiesAsAnEmptyWorkbook() {
+        // Matches the web editor's `catch { /* empty sheet, start fresh */ }`. The bespoke JSON is
+        // in here deliberately: it is no longer a format this app reads.
+        for body in ["", "not a package at all", "{}", "null",
+                     #"{"sheets":[{"name":"Old","cells":{}}]}"#] {
             let file = SheetFile.decode(from: Data(body.utf8))
-            XCTAssertTrue(file.sheets.isEmpty || file.sheets.count == 1,
-                          "unexpected sheets for body: \(body)")
+            XCTAssertEqual(file.sheets.count, 1, "unexpected sheets for body: \(body)")
+            XCTAssertTrue(file.sheets[0].cells.isEmpty, body)
         }
     }
 
@@ -280,7 +322,7 @@ final class WorkbookCodecTests: XCTestCase {
     // MARK: - Used bounds
 
     func testUsedBoundsCoverMergeSpans() throws {
-        let file = SheetFile.decode(from: Data(webWorkbookJSON.utf8))
+        let file = try decodeJSON(webWorkbookJSON)
         let bounds = try XCTUnwrap(file.sheets[0].usedBounds)
 
         // C1 spans two columns and two rows, so the used area reaches D2 (column 4, row 2).
