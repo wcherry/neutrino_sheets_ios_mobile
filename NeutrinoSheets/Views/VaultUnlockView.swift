@@ -1,5 +1,4 @@
 import SwiftUI
-import NeutrinoAuth
 import NeutrinoUI
 
 // MARK: - VaultUnlockView
@@ -13,7 +12,6 @@ import NeutrinoUI
 // vault existed.
 
 struct VaultUnlockView: View {
-    @Binding var isPresented: Bool
 
     /// Called after the key lands in the Keychain, so the caller can refresh
     /// anything that was blocked on it.
@@ -25,7 +23,9 @@ struct VaultUnlockView: View {
     @State private var errorMessage = ""
     @State private var showSuccess = false
 
-    @EnvironmentObject private var authService: AuthService
+    @EnvironmentObject private var vault: KeyVaultService
+
+    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
@@ -115,11 +115,17 @@ struct VaultUnlockView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { isPresented = false }
+                    Button("Not Now") { dismiss() }
                         .disabled(isWorking)
                 }
             }
+            .task {
+                // Which methods are enrolled decides what this screen can offer, and a sheet
+                // opened straight after sign-in may be the first thing that asks for them.
+                if vault.vault == nil { await vault.refresh() }
+            }
         }
+        .interactiveDismissDisabled(isWorking)
     }
 
     // MARK: - Actions
@@ -130,16 +136,11 @@ struct VaultUnlockView: View {
         errorMessage = ""
         defer { isWorking = false }
 
-        let service = KeyVaultService(authService: authService)
         do {
-            guard let vault = try await service.fetchVault() else {
-                errorMessage = KeyVaultError.noVault.localizedDescription
-                return
-            }
             if useRecoveryCode {
-                try await service.unlock(vault: vault, recoveryCode: secret)
+                try await vault.unlock(recoveryCode: secret)
             } else {
-                try await service.unlock(vault: vault, password: secret)
+                try await vault.unlock(password: secret)
             }
             secret = ""
             showSuccess = true
@@ -147,7 +148,9 @@ struct VaultUnlockView: View {
             // Leave the confirmation on screen briefly so the unlock is visibly
             // acknowledged rather than the sheet just vanishing.
             try? await Task.sleep(nanoseconds: 700_000_000)
-            isPresented = false
+            dismiss()
+        } catch is CancellationError {
+            // The sheet went away mid-unlock; nothing to report.
         } catch {
             errorMessage = error.localizedDescription
         }

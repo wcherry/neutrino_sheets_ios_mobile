@@ -10,7 +10,7 @@ import NeutrinoCrypto
 // JSONDecoder — the app's shared snake-case-converting decoder would rewrite
 // `memoryKiB` inside the params blob and break derivation.
 
-struct VaultUnlockMethod: Codable {
+struct VaultUnlockMethod: Codable, Equatable {
     let id: String
     /// "password" | "passkey" | "recovery"
     let method: String
@@ -23,7 +23,7 @@ struct VaultUnlockMethod: Codable {
     let lastUsedAt: String?
 }
 
-struct VaultResponse: Codable {
+struct VaultResponse: Codable, Equatable {
     /// base64url( nonce || ciphertext of the Curve25519 secret key ).
     let encryptedIdentity: String
     let publicKey: String
@@ -58,6 +58,29 @@ enum KeyVaultError: LocalizedError {
     }
 }
 
+// MARK: - VaultStatus
+
+/// What this device can currently do with the account's encryption key.
+///
+/// `locked` is the one that matters at sign-in: the account has published an identity and this
+/// device does not hold it, so every spreadsheet would fail to open with "No encryption key found"
+/// (see `SheetContentError.noEncryptionKey`) at the moment the user tried to read one. Knowing it
+/// straight after sign-in is what lets the app ask for the encryption password then instead.
+enum VaultStatus: Equatable {
+    /// Not asked yet — the launch state, before the first `refresh()`.
+    case unknown
+    /// The identity key is on this device.
+    case unlocked
+    /// The account has a vault and this device does not hold its key.
+    case locked
+    /// The account has never created a vault. Only a key file or a recovery kit can help.
+    case noVault
+    /// The vault could not be fetched: offline, or the server said something unexpected.
+    case unreachable
+
+    var isUnlocked: Bool { self == .unlocked }
+}
+
 // MARK: - KeyVaultService
 //
 // Fetches the wrapped identity key and opens it with a password or recovery
@@ -68,11 +91,24 @@ enum KeyVaultError: LocalizedError {
 // user set on the web unlocks the same identity here.
 //
 // Not implemented on this platform: passkey (PRF) unlock. The blob is stored
-// and listed, and `unlock(vault:password:)` skips it, so a passkey-only vault
+// and listed, and `unlock(password:)` skips it, so a passkey-only vault
 // reports that no password is enrolled rather than failing obscurely.
 
 @MainActor
-final class KeyVaultService {
+final class KeyVaultService: ObservableObject {
+
+    // MARK: - Published state
+
+    @Published private(set) var status: VaultStatus = .unknown
+
+    /// The account's vault, once fetched. Held so the unlock screen knows which methods are
+    /// enrolled and Settings can show the state without a second round trip.
+    @Published private(set) var vault: VaultResponse?
+
+    /// True when this device holds a key that is *not* this account's — what happens after signing
+    /// out and into a different Neutrino account without removing the old key. Worth saying out
+    /// loud, because the symptom otherwise is every spreadsheet failing to decrypt.
+    @Published private(set) var keyBelongsToAnotherAccount = false
 
     weak var authService: AuthService?
 
@@ -81,12 +117,86 @@ final class KeyVaultService {
 
     private static let decoder = JSONDecoder()
 
+    private let session: URLSession
+
     private var baseURL: String {
         UserDefaults.standard.string(forKey: AuthService.serverHostKey) ?? AuthService.defaultHost
     }
 
-    init(authService: AuthService? = nil) {
+    init(authService: AuthService? = nil, session: URLSession = .shared) {
         self.authService = authService
+        self.session = session
+    }
+
+    // MARK: - Status
+
+    /// Fetches the vault and works out where this device stands.
+    ///
+    /// Called at launch and after sign-in. Cheap enough to run every time — one GET — and it is the
+    /// only thing that can notice a key left behind by a different account.
+    func refresh() async {
+        do {
+            let fetched = try await fetchVault()
+            vault = fetched
+            guard let fetched else {
+                // No vault on the server. A key imported by hand or restored from a recovery kit is
+                // still a perfectly good key, so the presence of one still counts as unlocked.
+                keyBelongsToAnotherAccount = false
+                status = KeyImportService.hasStoredKeys() ? .unlocked : .noVault
+                return
+            }
+            let stored = KeyImportService.storedKeys()
+            let matches = stored.map { Self.samePublicKey($0.publicKey, fetched.publicKey) } ?? false
+            keyBelongsToAnotherAccount = stored != nil && !matches
+            status = matches ? .unlocked : .locked
+            logger.debug("vault refreshed: \(String(describing: self.status), privacy: .public)")
+        } catch is CancellationError {
+            // Not an answer about the vault — whatever asked went away. Leaving `status` alone
+            // matters: reporting `.unreachable` would put an offline warning on a screen that is
+            // merely being dismissed.
+            logger.debug("vault refresh cancelled")
+        } catch {
+            // Offline or a 5xx. Fall back to what the Keychain says rather than prompting for a
+            // password the server could not have verified anyway — an unreachable server is not
+            // evidence that this device has the wrong key.
+            logger.error("vault refresh failed: \(error.localizedDescription, privacy: .public)")
+            keyBelongsToAnotherAccount = false
+            status = KeyImportService.hasStoredKeys() ? .unlocked : .unreachable
+        }
+    }
+
+    /// Re-reads the Keychain without touching the network. Called after a key file is imported, a
+    /// recovery kit is restored, or a first-run key is minted.
+    func refreshFromKeychain() {
+        guard KeyImportService.hasStoredKeys() else {
+            keyBelongsToAnotherAccount = false
+            status = vault == nil ? .noVault : .locked
+            return
+        }
+        if let vault, let stored = KeyImportService.storedKeys() {
+            let matches = Self.samePublicKey(stored.publicKey, vault.publicKey)
+            keyBelongsToAnotherAccount = !matches
+            status = matches ? .unlocked : .locked
+            return
+        }
+        keyBelongsToAnotherAccount = false
+        status = .unlocked
+    }
+
+    /// Forgets everything this service learned about the account. Called on sign-out so the next
+    /// account to sign in here is asked about its own vault rather than judged against the last
+    /// one's.
+    func reset() {
+        vault = nil
+        keyBelongsToAnotherAccount = false
+        status = .unknown
+    }
+
+    /// Which unlock methods this build can actually offer, in the order the unlock screen shows
+    /// them. Passkey (PRF) unlock is not implemented here, so it is filtered out rather than
+    /// offered and then failed.
+    var availableMethods: [VaultUnlockMethod] {
+        (vault?.unlocks ?? []).filter { $0.method != "passkey" }
     }
 
     // MARK: - Fetch
@@ -100,7 +210,7 @@ final class KeyVaultService {
         var request = URLRequest(url: url)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw KeyVaultError.serverError(statusCode: 0)
         }
@@ -120,29 +230,31 @@ final class KeyVaultService {
 
     /// Unlock with the encryption password and store the identity in the Keychain.
     @discardableResult
-    func unlock(vault: VaultResponse, password: String) async throws -> KeyBundle {
-        try await unlock(vault: vault, secret: password, method: "password")
+    func unlock(password: String) async throws -> KeyBundle {
+        try await unlock(secret: password, method: "password")
     }
 
     /// Unlock with the recovery code shown when the vault was created.
     @discardableResult
-    func unlock(vault: VaultResponse, recoveryCode: String) async throws -> KeyBundle {
-        try await unlock(vault: vault,
-                         secret: KeyVaultCrypto.normalizeRecoveryCode(recoveryCode),
+    func unlock(recoveryCode: String) async throws -> KeyBundle {
+        try await unlock(secret: KeyVaultCrypto.normalizeRecoveryCode(recoveryCode),
                          method: "recovery")
     }
 
-    private func unlock(vault: VaultResponse, secret: String, method: String) async throws -> KeyBundle {
+    private func unlock(secret: String, method: String) async throws -> KeyBundle {
+        let vault = try await requireVault()
         guard let unlockMethod = vault.unlocks.first(where: { $0.method == method }) else {
             throw KeyVaultError.methodNotEnrolled(method)
         }
 
         let params = try decodeArgon2Params(unlockMethod.params)
-        let masterKey = try KeyVaultCrypto.unwrapMasterKey(
-            encryptedMasterKey: unlockMethod.encryptedMasterKey,
-            secret: secret,
-            params: params
-        )
+        // Argon2id is deliberately slow — around a second on an older phone — so the stretching
+        // happens off the main actor, where it cannot freeze the unlock screen's own spinner.
+        let encryptedMasterKey = unlockMethod.encryptedMasterKey
+        let masterKey = try await Task.detached(priority: .userInitiated) {
+            try KeyVaultCrypto.unwrapMasterKey(encryptedMasterKey: encryptedMasterKey,
+                                               secret: secret, params: params)
+        }.value
         let identity = try KeyVaultCrypto.openVault(
             encryptedIdentity: vault.encryptedIdentity,
             publicKeyB64URL: vault.publicKey,
@@ -157,6 +269,8 @@ final class KeyVaultService {
             keyVersion: String(vault.version)
         )
         KeyImportService.storeKeys(bundle)
+        keyBelongsToAnotherAccount = false
+        status = .unlocked
         logger.info("unlock: vault opened via \(method, privacy: .public)")
 
         // The vault holds one identity, the active one. Anything sealed to a version this account
@@ -167,6 +281,15 @@ final class KeyVaultService {
         // Bookkeeping only — a failure here must not fail the unlock.
         await markUsed(unlockMethod.id)
         return bundle
+    }
+
+    /// The cached vault, fetching it first if `refresh()` has not run — an unlock screen opened
+    /// straight from a banner may be the first thing that needs it.
+    private func requireVault() async throws -> VaultResponse {
+        if let vault { return vault }
+        guard let fetched = try await fetchVault() else { throw KeyVaultError.noVault }
+        vault = fetched
+        return fetched
     }
 
     private func decodeArgon2Params(_ json: String) throws -> Argon2Params {
@@ -189,7 +312,7 @@ final class KeyVaultService {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        _ = try? await URLSession.shared.data(for: request)
+        _ = try? await session.data(for: request)
     }
 
     // MARK: - Auth
@@ -200,5 +323,16 @@ final class KeyVaultService {
             throw KeyVaultError.notAuthenticated
         }
         return token
+    }
+
+    // MARK: - Helpers
+
+    /// Compares two public keys across encodings: the vault serves base64url, while a key file
+    /// exported from the web app uses standard base64, and the two spellings of the same key must
+    /// not read as different accounts.
+    private static func samePublicKey(_ lhs: String, _ rhs: String) -> Bool {
+        guard let left = KeyVaultCrypto.decodeBase64URL(lhs),
+              let right = KeyVaultCrypto.decodeBase64URL(rhs) else { return false }
+        return left == right
     }
 }
