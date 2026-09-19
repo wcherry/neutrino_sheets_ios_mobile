@@ -196,10 +196,20 @@ struct SheetBrowserView: View {
                         Label("New Folder", systemImage: "folder.badge.plus")
                     }
                     .disabled(!networkMonitor.isOnline)
+
+                    Divider()
+
+                    // Deliberately not disabled offline like the two above. Those need the Drive
+                    // API; this one opens Safari — and the bug most worth reporting is often the
+                    // one that just took the app off the network.
+                    ReportBugButton()
                 } label: {
                     Image(systemName: "plus")
                 }
-                .accessibilityLabel("Create")
+                // The menu is no longer only about creating things. VoiceOver reads this label
+                // instead of the glyph, so leaving it at "Create" would hide the report from
+                // exactly the people most likely to have something to file.
+                .accessibilityLabel("Create and more")
             }
         }
     }
