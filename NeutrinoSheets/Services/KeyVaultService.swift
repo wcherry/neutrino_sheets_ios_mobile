@@ -149,6 +149,7 @@ final class KeyVaultService: ObservableObject {
             let matches = stored.map { Self.samePublicKey($0.publicKey, fetched.publicKey) } ?? false
             keyBelongsToAnotherAccount = stored != nil && !matches
             status = matches ? .unlocked : .locked
+            if matches, let stored { await repairStoredKeyVersion(publicKey: stored.publicKey) }
             logger.debug("vault refreshed: \(String(describing: self.status), privacy: .public)")
         } catch is CancellationError {
             // Not an answer about the vault — whatever asked went away. Leaving `status` alone
@@ -263,10 +264,11 @@ final class KeyVaultService: ObservableObject {
 
         // Store base64url, matching what the web client writes and what the
         // existing import path already accepts.
+        let publicKey = KeyVaultCrypto.encodeBase64URL(identity.publicKey)
         let bundle = KeyBundle(
-            publicKey: KeyVaultCrypto.encodeBase64URL(identity.publicKey),
+            publicKey: publicKey,
             privateKey: KeyVaultCrypto.encodeBase64URL(identity.secretKey),
-            keyVersion: String(vault.version)
+            keyVersion: String(await keyVersion(of: publicKey))
         )
         KeyImportService.storeKeys(bundle)
         keyBelongsToAnotherAccount = false
@@ -281,6 +283,46 @@ final class KeyVaultService: ObservableObject {
         // Bookkeeping only — a failure here must not fail the unlock.
         await markUsed(unlockMethod.id)
         return bundle
+    }
+
+    // MARK: - Key version
+
+    /// The version the account's public-key directory gives `publicKey`.
+    ///
+    /// Not `vault.version`: that is the vault's *envelope format* version and is always 1. Filing
+    /// the key under it put every upload from a rotated account on record as v1 while it was
+    /// sealed to the active key, which the web then opened with the retired v1 key and reported as
+    /// "incorrect key pair". The directory's numbering is what `file_key_refs.key_version` means.
+    ///
+    /// Falls back to 1 when the directory cannot be asked; `refresh()` corrects it on the next
+    /// launch rather than failing an unlock that has already succeeded.
+    private func keyVersion(of publicKey: String) async -> Int {
+        do {
+            if let version = try await publishedVersion(of: publicKey) { return version }
+        } catch {
+            logger.error("keyVersion: directory lookup failed: \(error.localizedDescription, privacy: .public)")
+        }
+        return 1
+    }
+
+    private func publishedVersion(of publicKey: String) async throws -> Int? {
+        guard let userID = AccessToken.currentUserID() else { throw KeyVaultError.notAuthenticated }
+        return try await PublishedKeyDirectory.version(of: publicKey, userID: userID, baseURL: baseURL,
+                                                       token: try await authorizedToken(),
+                                                       session: session)
+    }
+
+    /// Corrects a key this device stored under the vault's envelope version instead of its own.
+    ///
+    /// Every device that unlocked from the vault before this fix holds its key as v1, whatever it
+    /// is. The archive pull skipped the key that really *is* v1 for the same reason, so it is run
+    /// again once the number is right — that is what makes pre-rotation files open here.
+    private func repairStoredKeyVersion(publicKey: String) async {
+        guard let published = try? await publishedVersion(of: publicKey),
+              published != KeyImportService.activeKeyVersion() else { return }
+        logger.info("repair: stored key is v\(published, privacy: .public), was filed as v\(KeyImportService.activeKeyVersion(), privacy: .public)")
+        KeyImportService.correctActiveKeyVersion(published)
+        try? await KeyFileService.shared.restoreArchivedKeys(authService: authService)
     }
 
     /// The cached vault, fetching it first if `refresh()` has not run — an unlock screen opened
