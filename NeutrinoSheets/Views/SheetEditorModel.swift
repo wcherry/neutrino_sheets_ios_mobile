@@ -31,6 +31,9 @@ final class SheetEditorModel: ObservableObject {
     @Published private(set) var isSaving = false
     @Published private(set) var hasUnsavedChanges = false
     @Published var loadError: String?
+    /// Set when the workbook on screen is this device's offline copy, kept on this date, because
+    /// the server could not be reached. It is read-only until reloaded from the server.
+    @Published private(set) var offlineCopyDate: Date?
     @Published var saveError: String?
     /// A short, self-clearing message for something worth saying but not worth interrupting for —
     /// "3 cells pasted", or the note that pasted formulas recalculate on the web.
@@ -124,7 +127,7 @@ final class SheetEditorModel: ObservableObject {
     /// Whether this account may write to the workbook. A spreadsheet shared read-only opens in a
     /// viewer, and every editing affordance is hidden rather than disabled-on-tap.
     var isEditable: Bool {
-        FeatureFlags.cellEditing && (info?.isEditable ?? false)
+        FeatureFlags.cellEditing && (info?.isEditable ?? false) && offlineCopyDate == nil
     }
 
     var sheetNames: [String] {
@@ -179,6 +182,7 @@ final class SheetEditorModel: ObservableObject {
             contentVersion = loaded.info.contentVersion
             needsInitialEncryption = loaded.needsInitialEncryption
             sourcePackage = loaded.sourcePackage
+            offlineCopyDate = loaded.offlineCopyDate
             activeSheetIndex = 0
             selection = SheetSelection(CellAddress(column: 1, row: 1))
             history.clear()
@@ -1055,6 +1059,16 @@ final class SheetEditorModel: ObservableObject {
             logger.error("save failed: \(error, privacy: .public)")
             saveError = error.localizedDescription
         }
+    }
+
+    /// Replaces an offline copy with the server's workbook, once there is a connection. Nothing to
+    /// lose: an offline copy cannot be edited.
+    func reloadFromServer() async {
+        guard offlineCopyDate != nil, !isLoading else { return }
+        file = nil
+        history.clear()
+        historyToken &+= 1
+        await load()
     }
 
     // MARK: - Conflict resolution

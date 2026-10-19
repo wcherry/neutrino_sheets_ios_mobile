@@ -747,7 +747,7 @@ final class SheetsDriveService: ObservableObject {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: req)
+            (data, response) = try await session.data(for: req, retry: .default)
         } catch {
             throw SheetsDriveError.networkError(underlying: error)
         }

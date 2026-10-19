@@ -1,4 +1,5 @@
 import SwiftUI
+import NeutrinoCore
 
 // MARK: - SheetEditorView
 
@@ -18,6 +19,7 @@ struct SheetEditorView: View {
     @EnvironmentObject private var contentService: SheetContentService
     @EnvironmentObject private var driveService: SheetsDriveService
     @EnvironmentObject private var settings: AppSettings
+    @EnvironmentObject private var networkMonitor: NetworkMonitor
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.dismiss) private var dismiss
 
@@ -73,6 +75,17 @@ struct SheetEditorView: View {
                 if phase != .active { flush() }
             }
             .onChange(of: model.selection) { selectionMoved(to: $0) }
+            // An offline copy is swapped for the real workbook as soon as the server is back. A
+            // workbook that failed to open at all is tried again too.
+            .onChange(of: networkMonitor.isOnline) { online in
+                guard online else { return }
+                if model.offlineCopyDate != nil {
+                    Task { await model.reloadFromServer() }
+                } else if model.loadError != nil, model.file == nil {
+                    model.loadError = nil
+                    Task { await model.load() }
+                }
+            }
             .sheet(isPresented: $showRename) {
                 RenameSheet(item: item)
             }
@@ -121,6 +134,22 @@ struct SheetEditorView: View {
             }
     }
 
+    /// Says that what is on screen is this device's copy, and that it cannot be edited.
+    private func offlineCopyBanner(_ kept: Date) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "lock.doc")
+            Text("Offline copy from \(kept.formatted(.relative(presentation: .named))). Read-only until you're back online.")
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .padding(.horizontal)
+        .padding(.vertical, 6)
+        .background(.bar)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("offlineCopyBanner")
+    }
+
     @ViewBuilder
     private var content: some View {
         if model.isLoading && model.file == nil {
@@ -130,6 +159,9 @@ struct SheetEditorView: View {
             errorState(loadError)
         } else {
             VStack(spacing: 0) {
+                if let kept = model.offlineCopyDate {
+                    offlineCopyBanner(kept)
+                }
                 if settings.showFormulaBar {
                     formulaBar
                     Divider()
