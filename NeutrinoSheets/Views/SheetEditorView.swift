@@ -1,5 +1,6 @@
 import SwiftUI
 import NeutrinoCore
+import NeutrinoPrint
 
 // MARK: - SheetEditorView
 
@@ -26,6 +27,9 @@ struct SheetEditorView: View {
     // MARK: - State
 
     @StateObject private var model: SheetEditorModel
+
+    /// Builds print jobs and presents the print dialog — shared with the other Neutrino apps.
+    @StateObject private var printer = PrintCoordinator()
 
     /// The text being typed into the selected cell, or nil when not editing.
     @State private var editingText: String?
@@ -64,6 +68,7 @@ struct SheetEditorView: View {
             .navigationTitle(model.title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { toolbarContent }
+            .printCoordinator(printer)
             .task { await load() }
             // A `.task` rather than a loose `Task {}`: SwiftUI cancels it when the view goes away,
             // and a detached timer would go on saving a workbook nobody has open.
@@ -562,6 +567,18 @@ struct SheetEditorView: View {
                     }
                 }
 
+                if canPrint {
+                    Section {
+                        PrintMenuButton(printer) { try printJob(selectionOnly: false) }
+
+                        if let selection = model.selection, !selection.isSingleCell {
+                            PrintMenuButton(printer, title: "Print Selection\u{2026}") {
+                                try printJob(selectionOnly: true)
+                            }
+                        }
+                    }
+                }
+
                 Section {
                     Button {
                         model.queueSave()
@@ -583,6 +600,29 @@ struct SheetEditorView: View {
             }
             .accessibilityLabel("Actions")
         }
+    }
+
+    // MARK: - Printing
+
+    /// A workbook prints once it is open, editable or not.
+    private var canPrint: Bool {
+        FeatureFlags.printing && NeutrinoPrinter.isAvailable && model.activeSheet != nil
+    }
+
+    /// The active tab as it stands — unsaved edits, frozen panes and filters included.
+    private func printJob(selectionOnly: Bool) throws -> PrintJob {
+        guard let sheet = model.activeSheet else { throw PrintError.unavailable }
+        let names = model.sheetNames
+        return SheetPrint.job(
+            title: model.title,
+            sheetName: names.count > 1 && names.indices.contains(model.activeSheetIndex)
+                ? names[model.activeSheetIndex] : nil,
+            sheet: sheet,
+            range: selectionOnly ? model.selection?.range : nil,
+            frozen: model.frozen,
+            hiddenRows: model.filteredRows,
+            showGridLines: settings.showGridLines
+        )
     }
 
     /// Epic 10 — the structural commands, mirroring the header menu.

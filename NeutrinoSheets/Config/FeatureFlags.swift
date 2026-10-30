@@ -52,6 +52,10 @@ enum FeatureFlags {
     /// *on*: every command behind it goes through the same `isEditable` guard a typed value does.
     static let structure: Bool = true
 
+    /// Printing the sheet, or the selection, over AirPrint from the actions menu. The pages are laid
+    /// out by NeutrinoPrint in neutrino_shared_ios; see `SheetPrint`.
+    static let printing: Bool = true
+
     /// Epic 25 — accepting inbound `https://www.getneutrino.app/open/sheet/<id>` Universal Links.
     ///
     /// Off, and deliberately: the deployed `apple-app-site-association` still routes `/open/sheet/*`

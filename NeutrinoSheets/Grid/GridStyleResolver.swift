@@ -8,8 +8,14 @@ import UIKit
 /// Everything here is memoised. A screenful of a dense workbook is a few hundred cells, most of
 /// them sharing a handful of styles, and parsing `"#1f2937"` or building a `UIFont` per cell per
 /// frame is the difference between a grid that scrolls at 60fps and one that does not.
-@MainActor
+///
+/// Not bound to the main actor: printing draws the same cells, and the print system may draw a page
+/// off the main thread. The two memo tables are the only shared state, and both sit behind
+/// ``cacheLock`` — an uncontended lock costs nanoseconds against the font construction it saves.
 enum GridStyleResolver {
+
+    /// Guards ``colorCache`` and ``fontCache``.
+    private static let cacheLock = NSLock()
 
     // MARK: - Colours
 
@@ -22,6 +28,8 @@ enum GridStyleResolver {
         guard let css else { return nil }
         let key = css.trimmingCharacters(in: .whitespaces).lowercased()
         guard !key.isEmpty, key != "none", key != "transparent", key != "inherit" else { return nil }
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
         if let cached = colorCache[key] { return cached }
         let parsed = parseColor(key)
         colorCache[key] = parsed
@@ -85,6 +93,8 @@ enum GridStyleResolver {
         let size = style?.pointSize ?? defaultSize
         let key = FontKey(family: style?.fontFamily, size: size,
                           bold: style?.isBold ?? false, italic: style?.isItalic ?? false)
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
         if let cached = fontCache[key] { return cached }
 
         var font = customFont(named: key.family, size: size)
@@ -183,6 +193,8 @@ enum GridStyleResolver {
     /// workbook with hundreds of distinct styles is the case where the caches are worth the most
     /// and cost the most.
     static func flushCaches() {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
         colorCache.removeAll(keepingCapacity: true)
         fontCache.removeAll(keepingCapacity: true)
     }
