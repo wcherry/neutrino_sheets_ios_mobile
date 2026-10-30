@@ -218,6 +218,68 @@ final class SheetContentServiceTests: XCTestCase {
         XCTAssertEqual(loaded.dek, dek)
     }
 
+    // MARK: - Offline copies
+
+    private func installOfflineCache() -> URL {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("sheets-ofc-\(UUID().uuidString)")
+        service.offlineCache = OfflineFileCache(directory: directory)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        return directory
+    }
+
+    func testAnOpenedWorkbookOpensReadOnlyFromItsOfflineCopyWhenTheServerIsUnreachable() async throws {
+        _ = installOfflineCache()
+        let dek = Sodium().secretStream.xchacha20poly1305.key()
+        let workbook = #"{"sheets":[{"name":"Q3","cells":{"A1":{"id":"A1","value":"7"}}}]}"#
+        MockURLProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            let ok = { (data: Data) in
+                (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, data)
+            }
+            if path.hasSuffix("/info") { return ok(self.infoJSON(yourRole: "editor")) }
+            if path.hasSuffix("/key") { return ok(try self.keyRefJSON(for: dek)) }
+            return ok(try self.encrypted(workbook, with: dek))
+        }
+        let online = try await service.loadWorkbook(for: "sheet-1")
+        XCTAssertNil(online.offlineCopyDate)
+
+        MockURLProtocol.handler = { _ in throw URLError(.notConnectedToInternet) }
+        let offline = try await service.loadWorkbook(for: "sheet-1")
+
+        XCTAssertNotNil(offline.offlineCopyDate)
+        XCTAssertEqual(offline.file.sheets[0].cells["A1"]?.value, "7")
+        XCTAssertEqual(offline.dek, dek)
+        XCTAssertEqual(offline.info.name, "Budget")
+        XCTAssertEqual(offline.info.contentVersion, 4)
+        XCTAssertEqual(offline.info.yourRole, .editor)
+        XCTAssertEqual(service.offlineCopies.map(\.id), ["sheet-1"])
+    }
+
+    func testWithNoOfflineCopyTheNetworkErrorStands() async {
+        _ = installOfflineCache()
+        MockURLProtocol.handler = { _ in throw URLError(.notConnectedToInternet) }
+        do {
+            _ = try await service.loadWorkbook(for: "sheet-1")
+            XCTFail("expected the network error")
+        } catch SheetContentError.networkError {
+        } catch {
+            XCTFail("unexpected \(error)")
+        }
+    }
+
+    func testANewSpreadsheetsPlaintextSeedIsNotKept() async throws {
+        _ = installOfflineCache()
+        MockURLProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            let status = path.hasSuffix("/key") && request.httpMethod == "GET" ? 404 : 200
+            let body = path.hasSuffix("/info") ? self.infoJSON() : Data()
+            return (HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!, body)
+        }
+        let loaded = try await service.loadWorkbook(for: "sheet-1")
+        XCTAssertTrue(loaded.needsInitialEncryption)
+        XCTAssertTrue(service.offlineCopies.isEmpty)
+    }
+
     /// A spreadsheet whose body was never written — the window between `POST /drive/files` and the
     /// first save — has no content and no key. Decryption failing is expected here, and the empty
     /// body is an empty workbook rather than an error.

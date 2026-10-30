@@ -90,6 +90,9 @@ struct NeutrinoSheetsApp: App {
         // Idempotent: `.task` can run again if the scene is rebuilt, and every assignment here is a
         // plain reference write.
         contentService.authService = authService
+        if contentService.offlineCache == nil {
+            contentService.offlineCache = .inApplicationSupport(named: "OfflineSpreadsheets")
+        }
 
         driveService.authService = authService
         driveService.contentService = contentService
@@ -150,6 +153,7 @@ private struct RootView: View {
     @EnvironmentObject private var authService: AuthService
     @EnvironmentObject private var biometricService: BiometricAuthService
     @EnvironmentObject private var keyVaultService: KeyVaultService
+    @EnvironmentObject private var contentService: SheetContentService
 
     @State private var showsUnlock = false
     /// Offered once per launch. Somebody who dismissed it gets back through
@@ -189,8 +193,9 @@ private struct RootView: View {
         .onChange(of: authService.isAuthenticated) { isAuthenticated in
             guard isAuthenticated else {
                 // The next account to sign in here must be asked about its own vault rather than
-                // judged against the one that just left.
+                // judged against the one that just left — and must not find its spreadsheets.
                 keyVaultService.reset()
+                contentService.offlineCache?.removeAll()
                 return
             }
             // The launch-time refresh in `configure()` is skipped for a signed-out start, so this

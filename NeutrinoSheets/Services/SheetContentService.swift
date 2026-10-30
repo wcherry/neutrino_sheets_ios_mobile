@@ -108,6 +108,10 @@ final class SheetContentService: ObservableObject {
     /// Set once at app launch so the service can refresh tokens before requests.
     weak var authService: AuthService?
 
+    /// Where the last copy of each opened workbook is kept, for opening read-only offline. Nil in
+    /// tests that do not exercise it. Cleared on sign-out by the app.
+    var offlineCache: OfflineFileCache?
+
     // MARK: - Private
 
     private static let sodium = Sodium()
@@ -223,6 +227,10 @@ final class SheetContentService: ObservableObject {
         /// app nor the web understands — a pivot table, an image, a chart Excel wrote. Nil when the
         /// stored body was not a package, which for a spreadsheet means it had no content yet.
         var sourcePackage: Data?
+        /// When this device kept the copy that was opened, if it came from ``offlineCache`` because
+        /// the server could not be reached. Such a workbook is opened read-only: an edit to it
+        /// could not be saved, and would be written against a version that may be long gone.
+        var offlineCopyDate: Date? = nil
     }
 
     /// Downloads, decrypts and decodes a workbook.
@@ -239,7 +247,22 @@ final class SheetContentService: ObservableObject {
     ///   with an empty workbook would turn a recoverable fault into data loss.
     ///
     /// This mirrors `isNewEncryption` in the web app's `useEncryptedDocumentContent`.
+    ///
+    /// When the server cannot be reached at all, the copy this device kept the last time the
+    /// workbook opened is returned instead, read-only — see ``LoadedWorkbook/offlineCopyDate``.
     func loadWorkbook(for fileID: String) async throws -> LoadedWorkbook {
+        do {
+            return try await loadWorkbookFromServer(fileID)
+        } catch SheetContentError.networkError(let underlying) {
+            guard let offline = try openOfflineCopy(of: fileID) else {
+                throw SheetContentError.networkError(underlying: underlying)
+            }
+            logger.debug("loadWorkbook: id=\(fileID, privacy: .public) opened from the offline copy")
+            return offline
+        }
+    }
+
+    private func loadWorkbookFromServer(_ fileID: String) async throws -> LoadedWorkbook {
         logger.debug("loadWorkbook: id=\(fileID, privacy: .public)")
 
         guard let info = try await fileInfo(for: fileID) else { throw SheetContentError.notFound }
@@ -248,7 +271,8 @@ final class SheetContentService: ObservableObject {
         }
 
         let token = try await authorizedToken()
-        let (dek, isNewKey) = try await resolveDEK(fileID: fileID, token: token)
+        let (dek, sealed) = try await resolveDEK(fileID: fileID, token: token)
+        let isNewKey = sealed == nil
         let stored = try await fetchEncryptedContent(fileID: fileID, token: token)
 
         var needsInitialEncryption = false
@@ -269,6 +293,11 @@ final class SheetContentService: ObservableObject {
         // all, and that is an empty workbook rather than an error. See `SheetFile.decode(from:)`.
         let file = SheetFile.decode(from: plaintext)
         logger.debug("loadWorkbook succeeded: id=\(fileID, privacy: .public) sheets=\(file.sheets.count)")
+        // Only a body that is really sealed with a key the server holds is worth keeping: the
+        // plaintext seed of a brand-new file is about to be replaced by its first save.
+        if let sealed, !needsInitialEncryption {
+            keepOfflineCopy(of: fileID, ciphertext: stored, sealed: sealed, info: info)
+        }
         return LoadedWorkbook(file: file, dek: dek, info: info,
                               needsInitialEncryption: needsInitialEncryption,
                               sourcePackage: XlsxCodec.isWorkbook(plaintext) ? plaintext : nil)
@@ -276,16 +305,115 @@ final class SheetContentService: ObservableObject {
 
     /// Fetches the file's sealed DEK, generating and storing one if the file has none yet.
     ///
-    /// Returns whether the key was newly generated, which is the only thing that makes reading a
-    /// failed decryption as plaintext safe.
-    private func resolveDEK(fileID: String, token: String) async throws -> (dek: Bytes, isNew: Bool) {
+    /// Returns the existing sealed key, or nil when the key was newly generated — which is the
+    /// only thing that makes reading a failed decryption as plaintext safe.
+    private func resolveDEK(fileID: String, token: String) async throws -> (dek: Bytes, sealed: SealedFileKey?) {
         if let sealed = try await fetchSealedDEK(fileID: fileID, token: token) {
-            return (try unsealDEK(sealed.sealed, keyVersion: sealed.keyVersion, fileID: fileID), false)
+            return (try unsealDEK(sealed.sealed, keyVersion: sealed.keyVersion, fileID: fileID), sealed)
         }
         let dek: Bytes = Self.sodium.secretStream.xchacha20poly1305.key()
         try await storeFileKey(fileID: fileID, sealedFileKey: try sealDEK(dek), token: token)
         logger.debug("resolveDEK: generated a new key for id=\(fileID, privacy: .public)")
-        return (dek, true)
+        return (dek, nil)
+    }
+
+    // MARK: - Offline copies
+
+    /// The parts of ``SheetFileInfo`` an offline copy needs, in the cache's metadata slot.
+    private struct CachedInfo: Codable {
+        var id: String
+        var name: String
+        var sizeBytes: Int64
+        var folderID: String?
+        var mimeType: String?
+        var updatedAt: Date
+        var yourRole: String
+        var contentVersion: Int?
+
+        init(_ info: SheetFileInfo) {
+            id = info.id
+            name = info.name
+            sizeBytes = info.sizeBytes
+            folderID = info.folderID
+            mimeType = info.mimeType
+            updatedAt = info.updatedAt
+            yourRole = info.yourRole.rawValue
+            contentVersion = info.contentVersion
+        }
+
+        var info: SheetFileInfo {
+            SheetFileInfo(id: id, name: name, sizeBytes: sizeBytes, folderID: folderID, mimeType: mimeType,
+                          updatedAt: updatedAt, yourRole: ShareRole(serverValue: yourRole),
+                          contentVersion: contentVersion)
+        }
+    }
+
+    /// A workbook this device holds an offline copy of, for the Offline tab.
+    struct OfflineCopy: Identifiable, Equatable {
+        let info: SheetFileInfo
+        let storedAt: Date
+        var id: String { info.id }
+
+        var item: SheetItem {
+            SheetItem(id: info.id, name: info.name, type: .file, parentID: info.folderID,
+                      size: info.sizeBytes, modifiedAt: info.updatedAt, isTrashed: false,
+                      mimeType: info.mimeType, contentVersion: info.contentVersion,
+                      isShared: info.yourRole != .owner)
+        }
+    }
+
+    /// Every offline copy, most recently kept first.
+    var offlineCopies: [OfflineCopy] {
+        (offlineCache?.entries ?? []).compactMap { entry in
+            guard let cached = try? JSONDecoder().decode(CachedInfo.self, from: entry.metadata) else { return nil }
+            return OfflineCopy(info: cached.info, storedAt: entry.storedAt)
+        }
+    }
+
+    /// Best effort: a copy that cannot be written is a missed convenience, not a failed open.
+    private func keepOfflineCopy(of fileID: String, ciphertext: Data, sealed: SealedFileKey, info: SheetFileInfo) {
+        guard let offlineCache, let metadata = try? JSONEncoder().encode(CachedInfo(info)) else { return }
+        do {
+            try offlineCache.store(fileID: fileID, ciphertext: ciphertext, sealedKey: sealed.sealed,
+                                   keyVersion: sealed.keyVersion, metadata: metadata)
+        } catch {
+            logger.error("keepOfflineCopy: id=\(fileID, privacy: .public) failed: \(error, privacy: .public)")
+        }
+    }
+
+    /// Brings an offline copy up to what a save just wrote, so the copy is never older than this
+    /// device's own last edit. Only a workbook that already has a copy is refreshed.
+    private func refreshOfflineCopy(of fileID: String, ciphertext: Data, result: SaveResult) {
+        guard let entry = offlineCache?.entry(for: fileID),
+              var cached = try? JSONDecoder().decode(CachedInfo.self, from: entry.metadata) else { return }
+        cached.updatedAt = result.updatedAt
+        cached.sizeBytes = result.sizeBytes
+        cached.contentVersion = result.contentVersion
+        keepOfflineCopy(of: fileID, ciphertext: ciphertext,
+                        sealed: SealedFileKey(sealed: entry.sealedKey, keyVersion: entry.keyVersion),
+                        info: cached.info)
+    }
+
+    /// Decrypts the kept copy with this device's own keys. Nil when there is none.
+    ///
+    /// No `fileID` is passed to the unseal, so a misfiled ref is not re-filed from here: that is a
+    /// server write, and there is no server.
+    private func openOfflineCopy(of fileID: String) throws -> LoadedWorkbook? {
+        guard let (entry, ciphertext) = offlineCache?.copy(for: fileID),
+              let cached = try? JSONDecoder().decode(CachedInfo.self, from: entry.metadata) else { return nil }
+        let dek = try unsealDEK(entry.sealedKey, keyVersion: entry.keyVersion)
+        let plaintext: Data
+        do {
+            plaintext = try decrypt(data: ciphertext, dek: dek)
+        } catch {
+            // Corrupt or from a key since rotated away: useless, and would fail the same way again.
+            offlineCache?.remove(fileID: fileID)
+            return nil
+        }
+        return LoadedWorkbook(file: SheetFile.decode(from: plaintext), dek: dek, info: cached.info,
+                              needsInitialEncryption: false,
+                              sourcePackage: XlsxCodec.isWorkbook(plaintext) ? plaintext : nil,
+                              offlineCopyDate: entry.storedAt)
     }
 
     // MARK: - Save
@@ -346,8 +474,10 @@ final class SheetContentService: ObservableObject {
         do {
             let updated = try Self.decoder.decode(APIFileResponse.self, from: data)
             logger.debug("save succeeded: id=\(fileID, privacy: .public)")
-            return SaveResult(updatedAt: updated.updatedAt, sizeBytes: updated.sizeBytes,
-                              contentVersion: updated.contentVersion)
+            let result = SaveResult(updatedAt: updated.updatedAt, sizeBytes: updated.sizeBytes,
+                                    contentVersion: updated.contentVersion)
+            refreshOfflineCopy(of: fileID, ciphertext: ciphertext, result: result)
+            return result
         } catch {
             throw SheetContentError.decodingError(underlying: error)
         }
@@ -507,7 +637,7 @@ final class SheetContentService: ObservableObject {
 
     private func data(for request: URLRequest) async throws -> (Data, URLResponse) {
         do {
-            return try await session.data(for: request)
+            return try await session.data(for: request, retry: .default)
         } catch {
             throw SheetContentError.networkError(underlying: error)
         }

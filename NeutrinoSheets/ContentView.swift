@@ -1,5 +1,6 @@
 import SwiftUI
 import NeutrinoCore
+import NeutrinoUI
 
 // MARK: - ContentView
 
@@ -11,6 +12,7 @@ struct ContentView: View {
 
     @EnvironmentObject private var driveService: SheetsDriveService
     @EnvironmentObject private var deepLinkRouter: DeepLinkRouter
+    @EnvironmentObject private var networkMonitor: NetworkMonitor
 
     @State private var selectedTab: Tab = .home
     /// Home's navigation stack, owned here rather than by ``SheetBrowserView`` so a Universal Link
@@ -24,6 +26,9 @@ struct ContentView: View {
 
     var body: some View {
         tabs
+            // Sheets queues no edits made offline; an offline copy opens read-only. The strip says
+            // so rather than promising a sync.
+            .connectivityBanner(isOnline: networkMonitor.isOnline, keepsChangesOffline: false)
             // A spreadsheet link has to land on Home whatever the user was last looking at: that is
             // the stack the editor is pushed onto.
             .onChange(of: deepLinkRouter.pending?.id) { pendingID in
@@ -116,36 +121,78 @@ struct ContentView: View {
 
 // MARK: - OfflineView
 
-/// Epic 1 — the Offline tab and its empty state.
+/// The spreadsheets this device keeps a copy of — every one opened recently — which open read-only
+/// without a connection.
 ///
-/// Deliberately just the empty state: offline caching, the edit queue and background sync are
-/// Epic 12, in Phase 3. The tab ships now because the shell's tab set is Epic 1's deliverable and
-/// adding a tab later moves everything else under the user's thumb.
+/// The copies are made by ``SheetContentService`` when a workbook opens and refreshed when it
+/// saves; nothing is downloaded on purpose here. Editing offline, with a queue that syncs later,
+/// is a later release.
 struct OfflineView: View {
 
     @EnvironmentObject private var networkMonitor: NetworkMonitor
+    @EnvironmentObject private var contentService: SheetContentService
+
+    @State private var copies: [SheetContentService.OfflineCopy] = []
 
     var body: some View {
+        Group {
+            if copies.isEmpty {
+                emptyState
+            } else {
+                List {
+                    Section {
+                        ForEach(copies) { copy in
+                            NavigationLink {
+                                SheetEditorView(item: copy.item)
+                            } label: {
+                                row(copy)
+                            }
+                        }
+                        .onDelete(perform: remove)
+                    } footer: {
+                        Text("Spreadsheets you open are kept here, encrypted, and open read-only when you're offline.")
+                    }
+                }
+            }
+        }
+        .navigationTitle("Offline")
+        .onAppear(perform: reload)
+    }
+
+    private func row(_ copy: SheetContentService.OfflineCopy) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(copy.item.displayName)
+                .lineLimit(1)
+            Text("Kept \(copy.storedAt.formatted(.relative(presentation: .named)))")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var emptyState: some View {
         VStack(spacing: 12) {
             Image(systemName: networkMonitor.isOnline ? "arrow.down.circle" : "wifi.slash")
                 .font(.system(size: 40))
                 .foregroundStyle(.tertiary)
             Text("No offline spreadsheets")
                 .font(.headline)
-            Text("Keeping spreadsheets on this device for offline reading and editing is coming in a "
-                 + "later release. For now, opening one needs a connection.")
+            Text("Spreadsheets you open are kept on this device, so you can read them without a connection.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-            if !networkMonitor.isOnline {
-                Label("You are offline", systemImage: "exclamationmark.triangle")
-                    .font(.footnote)
-                    .foregroundStyle(.orange)
-                    .padding(.top, 4)
-            }
         }
         .padding(32)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .navigationTitle("Offline")
+    }
+
+    private func reload() {
+        copies = contentService.offlineCopies
+    }
+
+    private func remove(at offsets: IndexSet) {
+        for index in offsets {
+            contentService.offlineCache?.remove(fileID: copies[index].id)
+        }
+        reload()
     }
 }

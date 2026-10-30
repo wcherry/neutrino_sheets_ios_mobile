@@ -211,7 +211,7 @@ final class KeyVaultService: ObservableObject {
         var request = URLRequest(url: url)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: request, retry: .default)
         guard let http = response as? HTTPURLResponse else {
             throw KeyVaultError.serverError(statusCode: 0)
         }
