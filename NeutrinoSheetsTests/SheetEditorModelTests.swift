@@ -406,14 +406,14 @@ final class SheetEditorModelTests: XCTestCase {
         XCTAssertFalse(model.hasUnsavedChanges)
         XCTAssertNil(model.saveError)
         // The first save is guarded against the version the file was opened at.
-        let first = MockURLProtocol.requests.last { $0.httpMethod == "PUT" }
+        let first = MockURLProtocol.requests.last { $0.httpMethod == "PUT" && $0.url?.path.hasSuffix("/autosave") == true }
         XCTAssertEqual(first?.url?.query, "expectedContentVersion=4")
 
         // The second must use the version the first one produced (5), or it would be rejected as
         // stale against an edit this device itself made.
         model.commitEdit("2", at: CellAddress(column: 1, row: 2))
         await model.flush()
-        let next = MockURLProtocol.requests.last { $0.httpMethod == "PUT" }
+        let next = MockURLProtocol.requests.last { $0.httpMethod == "PUT" && $0.url?.path.hasSuffix("/autosave") == true }
         XCTAssertEqual(next?.url?.query, "expectedContentVersion=5")
     }
 
@@ -459,10 +459,10 @@ final class SheetEditorModelTests: XCTestCase {
 
         // And nothing more is written until the user decides — saving over an unresolved conflict
         // is exactly what must not happen.
-        let before = MockURLProtocol.requests.filter { $0.httpMethod == "PUT" }.count
+        let before = MockURLProtocol.requests.filter { $0.httpMethod == "PUT" && $0.url?.path.hasSuffix("/autosave") == true }.count
         model.saveIfNeeded()
         await model.flush()
-        XCTAssertEqual(MockURLProtocol.requests.filter { $0.httpMethod == "PUT" }.count, before)
+        XCTAssertEqual(MockURLProtocol.requests.filter { $0.httpMethod == "PUT" && $0.url?.path.hasSuffix("/autosave") == true }.count, before)
     }
 
     func testKeepingTheLocalCopySavesAgainstTheServersVersion() async throws {
@@ -492,7 +492,7 @@ final class SheetEditorModelTests: XCTestCase {
         XCTAssertNil(model.conflict)
         // The retry is guarded against version 9 — the one the server said it holds — so it
         // overwrites *that* revision and nothing newer.
-        let last = MockURLProtocol.requests.last { $0.httpMethod == "PUT" }
+        let last = MockURLProtocol.requests.last { $0.httpMethod == "PUT" && $0.url?.path.hasSuffix("/autosave") == true }
         XCTAssertEqual(last?.url?.query, "expectedContentVersion=9")
     }
 }
