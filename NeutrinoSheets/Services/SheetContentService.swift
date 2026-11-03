@@ -424,6 +424,8 @@ final class SheetContentService: ObservableObject {
         let sizeBytes: Int64
         /// The version the workbook is now at. Hold it and send it back on the next save.
         let contentVersion: Int?
+        /// Whether Drive holds a preview picture of the workbook. See ``SheetPreviewer``.
+        var hasPreview = false
     }
 
     /// Encrypts `file` with the workbook's DEK and PUTs it to the autosave endpoint.
@@ -475,12 +477,29 @@ final class SheetContentService: ObservableObject {
             let updated = try Self.decoder.decode(APIFileResponse.self, from: data)
             logger.debug("save succeeded: id=\(fileID, privacy: .public)")
             let result = SaveResult(updatedAt: updated.updatedAt, sizeBytes: updated.sizeBytes,
-                                    contentVersion: updated.contentVersion)
+                                    contentVersion: updated.contentVersion,
+                                    hasPreview: updated.coverThumbnailUrl != nil)
             refreshOfflineCopy(of: fileID, ciphertext: ciphertext, result: result)
             return result
         } catch {
             throw SheetContentError.decodingError(underlying: error)
         }
+    }
+
+    // MARK: - Preview
+
+    /// Stores `jpeg` as the workbook's Drive preview — the picture of its first page the Drive
+    /// grid shows.
+    ///
+    /// Unlike the content it is not encrypted: the server cannot draw a workbook it cannot read, so
+    /// the preview is the one picture of it that is stored in the clear, exactly like the
+    /// thumbnail an upload carries.
+    func setPreview(_ jpeg: Data, for fileID: String) async throws {
+        let token = try await authorizedToken()
+        var request = try makeRequest(method: "PUT", path: DriveThumbnail.path(fileID: fileID), token: token)
+        DriveThumbnail.prepare(&request, jpeg: jpeg)
+        let (data, response) = try await data(for: request)
+        try Self.checkStatus(response, data: data)
     }
 
     // MARK: - File info
@@ -745,6 +764,8 @@ private struct APIFileResponse: Decodable {
     /// Drive's optimistic-concurrency counter. Optional so a server that predates the field still
     /// decodes; a nil version just means the next save goes unguarded.
     let contentVersion: Int?
+    /// Where Drive serves the file's preview, or nil when it has none.
+    let coverThumbnailUrl: String?
 }
 
 private struct APIKeyResponse: Decodable {

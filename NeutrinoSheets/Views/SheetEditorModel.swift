@@ -57,6 +57,8 @@ final class SheetEditorModel: ObservableObject {
 
     private let item: SheetItem
     private var contentService: SheetContentService
+    /// Keeps the Drive preview showing page one. Made on load, once the file is known.
+    private var previewer: SheetPreviewer?
     private weak var driveService: SheetsDriveService?
     private let pasteboard: PasteboardWriting
 
@@ -187,6 +189,13 @@ final class SheetEditorModel: ObservableObject {
             selection = SheetSelection(CellAddress(column: 1, row: 1))
             history.clear()
             cutSource = nil
+
+            // An offline copy is read-only and its preview is the server's business.
+            if offlineCopyDate == nil {
+                let previewer = SheetPreviewer(fileID: item.id, contentService: contentService)
+                self.previewer = previewer
+                previewer.loaded(loaded.file, hasPreview: loaded.info.hasPreview, canEdit: isEditable)
+            }
 
             // A brand-new spreadsheet is still holding the server's *plaintext* seed. Encrypting it
             // is the first thing to do, before the user can type anything into it — but through the
@@ -1041,6 +1050,7 @@ final class SheetEditorModel: ObservableObject {
                                                        keeping: sourcePackage)
             contentVersion = result.contentVersion
             needsInitialEncryption = false
+            previewer?.saved(file, hasPreview: result.hasPreview)
             driveService?.spreadsheetWasSaved(itemID: item.id, size: result.sizeBytes,
                                               modifiedAt: result.updatedAt,
                                               contentVersion: result.contentVersion)
