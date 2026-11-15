@@ -552,23 +552,17 @@ final class SheetContentService: ObservableObject {
     /// Returns `Data` rather than `String` because the caller has to be able to hand the *stored*
     /// bytes to the JSON decoder when decryption fails on a plaintext seed, and a lossy
     /// `String(decoding:)` in between would quietly mangle anything that was not UTF-8.
+    ///
+    /// Reads a file body in any shape the platform writes — v0, NEB1 or Photos-chunked
+    /// (neutrino#318) — through `NeutrinoCrypto`'s `DriveFileCrypto`, the one reader every client
+    /// agrees on. Reading only v0 here meant a document another client wrote chunked would not open.
     func decrypt(data: Data, dek: Bytes) throws -> Data {
-        guard data.count > Self.secretStreamHeaderSize else {
-            logger.error("decrypt: data too short (\(data.count) bytes)")
+        do {
+            return try DriveFileCrypto.decrypt(data, dek: dek)
+        } catch {
+            logger.error("decrypt: failed (\(data.count) bytes) — wrong DEK or corrupted content")
             throw SheetContentError.decryptionFailed
         }
-        let header = Array(data.prefix(Self.secretStreamHeaderSize))
-        let ciphertext = Array(data.dropFirst(Self.secretStreamHeaderSize))
-        let xcss = Self.sodium.secretStream.xchacha20poly1305
-        guard let pull = xcss.initPull(secretKey: dek, header: header) else {
-            logger.error("decrypt: initPull failed — wrong key length or corrupt header")
-            throw SheetContentError.decryptionFailed
-        }
-        guard let (plaintext, _) = pull.pull(cipherText: ciphertext) else {
-            logger.error("decrypt: authentication failed — wrong DEK or corrupted content")
-            throw SheetContentError.decryptionFailed
-        }
-        return Data(plaintext)
     }
 
     /// Seals `dek` to the caller's **active** Curve25519 public key (`crypto_box_seal`), and
