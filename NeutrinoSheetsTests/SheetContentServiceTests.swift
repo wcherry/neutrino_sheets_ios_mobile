@@ -1,4 +1,5 @@
 import XCTest
+import NeutrinoCrypto
 import Sodium
 import NeutrinoCore
 @testable import NeutrinoSheets
@@ -464,6 +465,18 @@ final class SheetContentServiceTests: XCTestCase {
 
         let plaintext = try service.decrypt(data: ciphertext, dek: dek)
         XCTAssertEqual(String(decoding: plaintext, as: UTF8.self), workbook)
+    }
+
+    /// Another client may write the body as NEB1, the chunked format (neutrino#318).
+    func testDecryptOpensANEB1Body() throws {
+        let dek = Sodium().secretStream.xchacha20poly1305.key()
+        let workbook = Data((0..<20_000).map { UInt8(truncatingIfNeeded: $0 &* 7) })
+        let body = try DriveFileCrypto.encryptNEB1(workbook, dek: dek, chunkSize: 4096)
+        XCTAssertEqual(try service.decrypt(data: body, dek: dek), workbook)
+
+        var damaged = body
+        damaged[damaged.count - 1] ^= 1
+        XCTAssertThrowsError(try service.decrypt(data: damaged, dek: dek))
     }
 
     func testSealedDEKRoundTrip() throws {
