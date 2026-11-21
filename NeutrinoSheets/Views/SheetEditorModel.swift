@@ -507,10 +507,21 @@ final class SheetEditorModel: ObservableObject {
 
     private func shift(axis: StructuralAxis, operation: StructuralOperation, indices: [Int],
                        name: String, selectionAfter: SheetSelection?) {
-        guard !indices.isEmpty else { return }
-        editActiveSheet(name: name, selectionAfter: selectionAfter) { sheet in
-            StructuralShift.apply(to: sheet, axis: axis, operation: operation, indices: indices)
+        guard !indices.isEmpty, isEditable, let file, file.sheets.indices.contains(activeSheetIndex) else { return }
+        let active = activeSheetIndex
+        // A tab with no stored name is called what the web calls it, which is what its references say.
+        let targetName = file.sheets[active].name ?? "Sheet \(active + 1)"
+        // Other tabs' references to this one move with it, as on the web.
+        let sheets = file.sheets.enumerated().map { offset, sheet -> SheetData in
+            if offset == active {
+                return StructuralShift.apply(to: sheet, axis: axis, operation: operation, indices: indices)
+            }
+            return indices.reduce(sheet) { current, index in
+                StructuralShift.shiftReferences(in: current, toSheetNamed: targetName, axis: axis,
+                                                operation: operation, index: index) ?? current
+            }
         }
+        applyWorkbook(sheets, name: name, selectionAfter: selectionAfter)
     }
 
     // MARK: - Sizes
