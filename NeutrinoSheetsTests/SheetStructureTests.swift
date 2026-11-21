@@ -169,6 +169,30 @@ final class SheetStructureTests: XCTestCase {
 
     // MARK: - Undo
 
+    /// The bug this guards: an inserted row used to leave every formula pointing at the cells that
+    /// had been there, on this tab and on the tabs that name it — until the web recalculated them.
+    func testInsertingARowMovesFormulasHereAndOnOtherTabs() async throws {
+        try await load(#"""
+        {"sheets":[
+          {"name":"Q3","cells":{
+            "A1":{"id":"A1","raw":"1","value":"1"},
+            "A2":{"id":"A2","raw":"2","value":"2"},
+            "A3":{"id":"A3","raw":"=SUM(A1:A2)","value":"3"}}},
+          {"name":"Summary","cells":{"A1":{"id":"A1","raw":"=Q3!A3*2","value":"6"}}}]}
+        """#)
+        select("A1")
+
+        model.insertRows(before: true)
+
+        XCTAssertEqual(cell("A4")?.raw, "=SUM(A2:A3)")
+        XCTAssertEqual(cell("A4")?.value, "3")
+        XCTAssertEqual(model.file?.sheets[1].cells["A1"]?.raw, "=Q3!A4*2")
+
+        model.undo()
+        XCTAssertEqual(cell("A3")?.raw, "=SUM(A1:A2)")
+        XCTAssertEqual(model.file?.sheets[1].cells["A1"]?.raw, "=Q3!A3*2")
+    }
+
     func testUndoingAnInsertPutsEveryRowBack() async throws {
         try await load(listWorkbook)
         select("A2")
