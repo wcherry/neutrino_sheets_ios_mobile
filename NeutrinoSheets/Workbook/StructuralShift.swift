@@ -33,10 +33,11 @@ enum StructuralOperation {
 /// - A merge anchor only grows or shrinks when the edit lands *strictly inside* its span. An anchor
 ///   the edit sits on top of, or past, rides along with the ordinary per-cell shift.
 ///
-/// Two things the web app also does and this does too, because a workbook is shared between them:
+/// Three things the web app also does and this does too, because a workbook is shared between them:
 /// surviving ``TableRegion``s are re-banded against their new bounds — otherwise a row inserted into
-/// a table leaves an unstyled stripe — and conditional-format ranges are shifted with the cells they
-/// describe. Charts are deliberately left alone; `computeStructuralShift` does not touch them
+/// a table leaves an unstyled stripe — conditional-format ranges are shifted with the cells they
+/// describe, and **formula references move with the cells they name** (``shiftFormula(_:axis:operation:index:target:formulaOnTarget:)``),
+/// including references on other tabs that name this one. Charts are deliberately left alone; `computeStructuralShift` does not touch them
 /// either, and inventing a rule here would put this app and the browser in disagreement.
 enum StructuralShift {
 
@@ -247,6 +248,12 @@ enum StructuralShift {
             guard let moved = shift(range: range, axis: axis, operation: operation, index: index)
             else { continue }
             fields["range"] = .string(moved.address)
+            // A formula rule's own references move too, as the web's `shiftCFRules` does.
+            if var spec = fields["rule"]?.objectValue, spec["kind"]?.stringValue == "formula",
+               let formula = spec["formula"]?.stringValue {
+                spec["formula"] = .string(shiftFormula(formula, axis: axis, operation: operation, index: index))
+                fields["rule"] = .object(spec)
+            }
             shifted.append(.object(fields))
         }
         return .array(shifted)
@@ -269,6 +276,114 @@ enum StructuralShift {
         }
     }
 
+    // MARK: - Formulas
+
+    /// A string literal, which is skipped, or a reference: an optional sheet prefix, then a cell or
+    /// range. The lookarounds keep names that merely contain a reference (`LOG10(`, `Q1_total`) from
+    /// matching. The web's `FORMULA_REFERENCE`, character for character.
+    private static let formulaReference = try! NSRegularExpression(
+        pattern: #""[^"]*"|(?<![A-Za-z0-9_$.'])(?:('[^']+'|[A-Za-z_][A-Za-z0-9_]*)!)?(\$?)([A-Za-z]+)(\$?)(\d+)(?::(\$?)([A-Za-z]+)(\$?)(\d+))?(?![A-Za-z0-9_(!])"#)
+
+    /// The web's `shiftFormula`: a reference moves with its cell, a range grows or shrinks around the
+    /// edit, and a reference to a deleted cell becomes `#REF!`. `$` references move too — `$` pins a
+    /// reference against being copied, not against the sheet changing under it. A reference with no
+    /// sheet prefix belongs to the formula's own sheet, so it moves only when `formulaOnTarget`; a
+    /// prefixed one moves when it names `target` (case-insensitively).
+    static func shiftFormula(_ formula: String, axis: StructuralAxis, operation: StructuralOperation,
+                             index: Int, target: String? = nil, formulaOnTarget: Bool = true) -> String {
+        let ns = formula as NSString
+        let wanted = target?.lowercased()
+        var result = ""
+        var cursor = 0
+        for match in formulaReference.matches(in: formula, range: NSRange(location: 0, length: ns.length)) {
+            result += ns.substring(with: NSRange(location: cursor, length: match.range.location - cursor))
+            cursor = match.range.location + match.range.length
+            let whole = ns.substring(with: match.range)
+            func group(_ i: Int) -> String? {
+                let r = match.range(at: i)
+                return r.location == NSNotFound ? nil : ns.substring(with: r)
+            }
+            guard let col1 = group(3), let row1Text = group(5), let row1 = Int(row1Text) else {
+                result += whole // a string literal
+                continue
+            }
+            let prefix = group(1)
+            let onTarget: Bool
+            if let prefix {
+                var name = prefix
+                if name.hasPrefix("'") { name.removeFirst() }
+                if name.hasSuffix("'") { name.removeLast() }
+                onTarget = name.lowercased() == wanted
+            } else {
+                onTarget = formulaOnTarget
+            }
+            guard onTarget,
+                  let c1 = CellAddress.columnIndex(fromLetters: col1.uppercased()) else {
+                result += whole
+                continue
+            }
+            let col2 = group(7)
+            let c2 = col2.flatMap { CellAddress.columnIndex(fromLetters: $0.uppercased()) } ?? c1
+            let r2 = group(9).flatMap(Int.init) ?? row1
+            if col2 != nil, CellAddress.columnIndex(fromLetters: col2!.uppercased()) == nil {
+                result += whole
+                continue
+            }
+            let bounds = CellRange(CellAddress(column: min(c1, c2), row: min(row1, r2)),
+                                   CellAddress(column: max(c1, c2), row: max(row1, r2)))
+            guard let moved = shift(range: bounds, axis: axis, operation: operation, index: index) else {
+                result += "#REF!"
+                continue
+            }
+            if moved == bounds {
+                result += whole
+                continue
+            }
+            // A range may be written back to front (B3:A1); it stays that way round.
+            let d = { (i: Int) in group(i) ?? "" }
+            let startColumn = c1 <= c2 ? moved.start.column : moved.end.column
+            let startRow = row1 <= r2 ? moved.start.row : moved.end.row
+            var text = (prefix.map { "\($0)!" } ?? "") + d(2) + CellAddress.columnLetters(startColumn) + d(4) + String(startRow)
+            if col2 != nil {
+                let endColumn = c1 <= c2 ? moved.end.column : moved.start.column
+                let endRow = row1 <= r2 ? moved.end.row : moved.start.row
+                text += ":" + d(6) + CellAddress.columnLetters(endColumn) + d(8) + String(endRow)
+            }
+            result += text
+        }
+        result += ns.substring(from: cursor)
+        return result
+    }
+
+    /// A formula cell rewritten by an edit keeps its cached value — its references still name the
+    /// same cells — unless the edit deleted one of them, when it shows `#REF!` as the web's
+    /// recalculation would.
+    private static func shiftingFormula(of cell: SavedCell, axis: StructuralAxis, operation: StructuralOperation,
+                                        index: Int, target: String?, formulaOnTarget: Bool) -> SavedCell {
+        guard let raw = cell.raw, FormulaReferences.isFormula(raw) else { return cell }
+        let moved = shiftFormula(raw, axis: axis, operation: operation, index: index,
+                                 target: target, formulaOnTarget: formulaOnTarget)
+        guard moved != raw else { return cell }
+        var updated = cell
+        updated.raw = moved
+        if moved.contains("#REF!"), !raw.contains("#REF!") { updated.value = "#REF!" }
+        return updated
+    }
+
+    /// The same edit as another tab sees it: only references that name `target` move. Nil when
+    /// nothing on the tab did.
+    static func shiftReferences(in sheet: SheetData, toSheetNamed target: String, axis: StructuralAxis,
+                                operation: StructuralOperation, index: Int) -> SheetData? {
+        var changed = false
+        var result = sheet
+        for (id, cell) in sheet.cells {
+            let updated = shiftingFormula(of: cell, axis: axis, operation: operation, index: index,
+                                          target: target, formulaOnTarget: false)
+            if updated != cell { result.cells[id] = updated; changed = true }
+        }
+        return changed ? result : nil
+    }
+
     // MARK: - Whole sheet
 
     /// One structural edit applied to a whole tab — the orchestrator, matching
@@ -282,6 +397,8 @@ enum StructuralShift {
                       index: Int) -> SheetData {
         var result = sheet
         result.cells = shift(cells: sheet.cells, axis: axis, operation: operation, index: index)
+            .mapValues { shiftingFormula(of: $0, axis: axis, operation: operation, index: index,
+                                         target: sheet.name, formulaOnTarget: true) }
 
         var regions: [TableRegion] = []
         for region in sheet.tables ?? [] {

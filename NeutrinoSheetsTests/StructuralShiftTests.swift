@@ -343,4 +343,64 @@ final class StructuralShiftTests: XCTestCase {
         XCTAssertEqual(shifted.cells["A5"]?.value, "2")
         XCTAssertNil(shifted.cells["A2"])
     }
+
+    // MARK: - Formulas
+
+    /// The web's `structuralShift.test.ts` cases for `shiftFormula`, one for one.
+    func testFormulasShiftAsTheWebsDo() {
+        let cases: [(String, StructuralAxis, StructuralOperation, Int, String)] = [
+            ("=A1+C1", .column, .insert, 2, "=A1+D1"),
+            ("=B2+B5", .row, .insert, 3, "=B2+B6"),
+            ("=B2+B5", .row, .delete, 3, "=B2+B4"),
+            ("=$C$1+$C1+C$1", .column, .insert, 1, "=$D$1+$D1+D$1"),
+            ("=SUM(B1:D1)", .column, .insert, 3, "=SUM(B1:E1)"),
+            ("=SUM(B1:D1)", .column, .insert, 2, "=SUM(C1:E1)"),
+            ("=SUM(B1:D1)", .column, .insert, 5, "=SUM(B1:D1)"),
+            ("=SUM(B1:D1)", .column, .delete, 3, "=SUM(B1:C1)"),
+            ("=SUM(B1:B1)", .column, .delete, 2, "=SUM(#REF!)"),
+            ("=A1+B1", .column, .delete, 2, "=A1+#REF!"),
+            ("=SUM(D1:B1)", .column, .insert, 3, "=SUM(E1:B1)"),
+            (#"=IF(C1>0,"C1 ok",LOG10(C1))"#, .column, .insert, 1, #"=IF(D1>0,"C1 ok",LOG10(D1))"#),
+            ("=Beta!C1+'Net Worth'!C1:D1+C1", .column, .insert, 1, "=Beta!C1+'Net Worth'!C1:D1+D1"),
+        ]
+        for (formula, axis, operation, index, expected) in cases {
+            XCTAssertEqual(StructuralShift.shiftFormula(formula, axis: axis, operation: operation, index: index),
+                           expected, formula)
+        }
+        XCTAssertEqual(StructuralShift.shiftFormula("='Sheet 1'!C1", axis: .column, operation: .insert, index: 1,
+                                                    target: "sheet 1", formulaOnTarget: true), "='Sheet 1'!D1")
+        XCTAssertEqual(StructuralShift.shiftFormula("='Sheet 1'!C1:D1+C1", axis: .column, operation: .insert, index: 1,
+                                                    target: "Sheet 1", formulaOnTarget: false), "='Sheet 1'!D1:E1+C1")
+        XCTAssertEqual(StructuralShift.shiftFormula("='Sheet 1'!C1+1", axis: .column, operation: .delete, index: 3,
+                                                    target: "Sheet 1", formulaOnTarget: false), "=#REF!+1")
+    }
+
+    /// Inserting a row above a total moves the total *and* what it adds up, so it keeps its value.
+    func testAFormulaFollowsTheCellsItNamesWhenTheSheetShifts() {
+        let sheet = SheetData(name: "Budget", cells: [
+            "B2": cell("B2", "1200"),
+            "B3": cell("B3", "450.5"),
+            "B4": SavedCell(id: "B4", raw: "=SUM(B2:B3)", value: "1650.5"),
+        ])
+        let shifted = StructuralShift.apply(to: sheet, axis: .row, operation: .insert, index: 1)
+        XCTAssertEqual(shifted.cells["B5"]?.raw, "=SUM(B3:B4)")
+        XCTAssertEqual(shifted.cells["B5"]?.value, "1650.5")
+
+        let deleted = StructuralShift.apply(to: sheet, axis: .row, operation: .delete, index: 2)
+        XCTAssertEqual(deleted.cells["B3"]?.raw, "=SUM(B2:B2)")
+        let gone = StructuralShift.apply(to: SheetData(cells: ["C1": SavedCell(id: "C1", raw: "=A1+B1", value: "3")]),
+                                         axis: .column, operation: .delete, index: 2)
+        XCTAssertEqual(gone.cells["B1"]?.raw, "=A1+#REF!")
+        XCTAssertEqual(gone.cells["B1"]?.value, "#REF!")
+    }
+
+    func testAnotherTabsReferencesToTheShiftedSheetMove() {
+        let other = SheetData(name: "Summary", cells: [
+            "A1": SavedCell(id: "A1", raw: "=Budget!B4+B4", value: "1"),
+            "A2": cell("A2", "plain"),
+        ])
+        let moved = StructuralShift.shiftReferences(in: other, toSheetNamed: "Budget", axis: .row, operation: .insert, index: 1)
+        XCTAssertEqual(moved?.cells["A1"]?.raw, "=Budget!B5+B4")
+        XCTAssertNil(StructuralShift.shiftReferences(in: other, toSheetNamed: "Elsewhere", axis: .row, operation: .insert, index: 1))
+    }
 }
